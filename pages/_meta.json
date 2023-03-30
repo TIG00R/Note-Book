@@ -1,0 +1,18 @@
+{
+    "index": {
+      "title": "Note Book"
+    },
+    "note-book": {
+        "title": "Cheat Book",
+        "type": "page",
+        "href":"https://cheat-book.vercel.app"
+      },
+    "blog": {
+        "title": "Blog",
+        "type": "page"
+      },
+    "about": {
+      "title": "About",
+      "type": "page"
+    }
+}
