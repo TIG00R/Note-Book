@@ -1,3 +1,9 @@
 {
-    "engagement_planning":"Engagement Planning"
+    "engagement_planning":"Engagement Planning",
+    "c2_infra":"C2 Infra and Setup",
+    "edr_evasion":"EDR Evasion",
+    "hunting_the_hunters":"Hunting The Hunters",
+    "linux_helpful_commands":"Linux Helpful Commands",
+    "windows_helpful_commands":"Windows Helpful Commands"
+    
 }

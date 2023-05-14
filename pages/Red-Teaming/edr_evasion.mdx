@@ -1,0 +1,5 @@
+### Intro
+- EDRs can be thought of as AV on steroids.
+- In the past AV and EDR vendors were allowed to patch kernel code in order to inspect API calls as they transitioned into the kernel from userland with a driver, since these are designed to have the same privilege level as the kernel itself.
+- Then Microsoft introduced Kernel Patch Protection (aka "PatchGuard"), which prevents patching of the kernel.
+- Security vendors now are forced to carry out their inspection in userland, which is achieved by "API Hooking". There are multiple ways to do this like: "inline" and "IAT" hooking. 
