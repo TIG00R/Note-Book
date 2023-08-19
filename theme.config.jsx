@@ -1,7 +1,13 @@
 export default {
-    logo: <span>My Nextra Documentation</span>,
+    faviconGlyph:"👻",
+    logo: <span>A Hacker's Notebook 👻</span>,
     project: {
       link: 'https://github.com/shuding/nextra',
     },
+    useNextSeoProps() {
+     return {
+       titleTemplate: '%s'
+     }
+   }
     // ...
   }

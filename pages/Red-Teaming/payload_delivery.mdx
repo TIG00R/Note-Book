@@ -1,0 +1,23 @@
+- **There are broadly two options for delivering a payload**:
+    - Send a URL where a payload can be downloaded.
+    - Attach the payload to the phishing email.
+
+- Any file downloaded via a browser (outside of a trusted zone) will be tainted with the "Mark of the Web" (**MOTW**).  In a nutshell, this is a data stream that gets embedded into the file which says it was downloaded from an untrusted location. The zone data can be read with PowerShell.
+- Files that are emailed "internally" via a compromised Exchange mailbox are not tagged with a Zone Identifier.
+```PowerShell
+PS C:\Users\bfarmer\Downloads> gc .\test.txt -Stream Zone.Identifier
+[ZoneTransfer]
+ZoneId=3
+HostUrl=http://nickelviper.com/test.txt
+```
+**The possible zones are**:
+
+0 => Local computer
+1 => Local intranet
+2 => Trusted sites
+3 => Internet
+4 => Restricted sites
+
+
+- Both **Windows SmartScreen** and **Office Protected** View  often don't stop files from being opened or executed, but they require the user to click through more warning boxes which lower the likelihood of your phish being successful. 
+- If MS Office `block macros downloaded from the Internet` is `enabled`, a user cannot run a macro-enabled document even if they wanted to.

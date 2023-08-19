@@ -1,0 +1,5 @@
+{
+   "api_hooks":"API Hooks",
+  "dll_injection":"DLL Injection",
+  "process_injection":"Process Injection"
+}

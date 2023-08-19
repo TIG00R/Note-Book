@@ -1,0 +1,275 @@
+import { Callout } from 'nextra-theme-docs'
+import Image from 'next/image'
+
+### How EDRs work ?
+
+- Normally, EDRs collect information about the running processes and act upon it, either by just alterning or by blocking. One of the ways this can be done is by hooking the **NTDLL** (Called user-land API hooks) APIs to redirect the execution to the EDR so that It can analyze that request and Its parameters and make a decision if Its a malicious action or not.
+<Callout type="info" emoji="👻">
+**Userland Hooks** VS **KERNEL registered callbacks**:
+- **Userland Hooks**:
+ A way to do it is by code injection into **NTDLL**. Code injection involves adding custom code into the address space of a user-mode process, such as injecting code into a specific DLL like **NTDLL**. thus, **Altering the behaviour of specific processes**
+- **kernel callbacks** :
+ Kernel callbacks **operate at the kernel level of the operating system**. They involve registering functions that the kernel will call when specific kernel-level events or conditions occur. These events can include interrupt handling, file system operations, network activity, and more. 
+</Callout>
+- We will simulate the behaviour of the EDR by using [**injdrv**](https://github.com/wbenny/injdrv) which will register **kernel callbacks** to to selectively **hook a user-mode process**
+    1. The first is to load and start a new driver that will register two kernel callbacks called [PsSetCreateProcessNotifyRoutineEx](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntddk/nf-ntddk-pssetcreateprocessnotifyroutineex) and [PsSetLoadImageNotifyRoutine](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntddk/nf-ntddk-pssetloadimagenotifyroutine)
+    2. Upon receiving these notifications, the driver will forceably inject a DLL into the memory space of that process (or just ignore it if the DLL is already loaded).  That DLL will then hook numerous APIs to redirect their execution flow. In our example only the **NtOpenProcess** will be hooked. but any API can be hooked. 
+In this case the parameters of these function calls will be logged using ETW and displayed in the `injldr.exe` console
+
+<Callout type="info" emoji="👻">
+We just need to enable **Test Mode** so that we can use unsigned drivers
+```powershell copy filename="Powershell"
+bcdedit -set testsigning on
+```
+</Callout>
+
+ **Couldn't complete this example because **injdrv** project on github depends on another repo which we don't have permission to clone !!!**
+
+### Hook Bypass Strategies
+Since this is all happening in userland of a process that we control:
+
+- We can effectively unhook these inline-hooks by patching back over them to restore their original values.
+- We could even reload entire modules from disk (e.g. kernel32.dll, ntdll.dll etc) and map an entirely fresh copy into memory, erasing the hooks
+
+However, one rather significant downside is that some EDRs monitor the integrity of their own hooks.  So even if we did unhook them, the EDR can simply re-hook them at a later date and raise an alert that hook tampering was detected.
+
+A better strategy is to find different ways of executing the desired APIs, without ever touching the hooks.
+
+
+### Process Mitigation Policy
+- Injecting DLLs into processes can be prevented if the process is spawned with a proper `PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY`, like `PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY_BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON`. If the process is spanwed with this **Process Mitigation Policy**, Only microsoft signed DLLs can be injected into it.
+- We can use this mitigation technique in our favour to prevent EDRs from injecting into our beacon process, hence not get discovered easily
+- **Example**
+Usisng the same caode of **PPID Spoofing**
+```cs copy filename="mitigation-policy.cs" showLineNumbers {30-41}
+#include <Windows.h>
+#include <iostream>
+
+int main()
+{
+    const DWORD attributeCount = 1;
+
+    LPSTARTUPINFOEXW si = new STARTUPINFOEXW();
+    si->StartupInfo.cb = sizeof(STARTUPINFOEXW);
+
+    SIZE_T lpSize = 0;
+
+    // call once to get lpSize
+    InitializeProcThreadAttributeList(
+        NULL,
+        attributeCount,
+        0,
+        &lpSize);
+
+    // allocate the memory
+    si->lpAttributeList = (LPPROC_THREAD_ATTRIBUTE_LIST)malloc(lpSize);
+
+    // call again to initialise the list
+    InitializeProcThreadAttributeList(
+        si->lpAttributeList,
+        attributeCount,
+        0,
+        &lpSize);
+
+    //Prepare the policy
+    DWORD64 policy = PROCESS_CREATION_MITIGATION_POLICY_BLOCK_NON_MICROSOFT_BINARIES_ALWAYS_ON;
+
+    // update the list
+    UpdateProcThreadAttribute(
+        si->lpAttributeList,
+        NULL,
+        PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY,
+        &policy,
+        sizeof(HANDLE),
+        NULL,
+        NULL);
+
+    // create process
+    PPROCESS_INFORMATION pi = new PROCESS_INFORMATION();
+    wchar_t cmd[] = L"notepad.exe\0";
+
+    CreateProcess(
+        NULL,
+        cmd,
+        NULL,
+        NULL,
+        FALSE,
+        EXTENDED_STARTUPINFO_PRESENT,
+        NULL,
+        NULL,
+        &si->StartupInfo,
+        pi);
+
+    // cleanup list and memory
+    DeleteProcThreadAttributeList(si->lpAttributeList);
+    free(si->lpAttributeList);
+
+}
+```
+
+and we can see in **process hacker** that our **Mitigation Policy** is applied to the spawned **notepad.exe** process 
+![mitigation-policy-1](/images/mitigation-policy-1.png)
+
+<Callout type="info" emoji="👻">
+    The **Process Mitigation Policy** **DOES** mitigate against injecting DLLs into the protected process, but It **DOESN'T** mitigate against injecting shell code into them.
+- **Injecting DLL**: involves inserting an external library (DLL) into the memory space of a running process. This typically involves creating a remote thread in the target process, loading the DLL into that thread's address space, and then calling a specific function within the DLL. The `LoadLibrary` function is often used for this purpose.
+- **Shell Code Injection**: It can be done through methods like creating a remote thread, modifying existing code segments, or utilizing vulnerabilities to execute the injected code. **But the most important thing is that Its done without loading DLLs into the target process**
+
+- Long story short, These **Process Mitigation policies** can't  prevent the beacon shellcode from being injected into a process with **Process Mtigitaion Policy** enabled on it. such as the payloads injected with **GadgettoJScript** ( *which inject beacon shellcode into  running MS office processes through macros* ).
+-  Beacon also has a setting called **`blockdlls`** which instructs it to use this mitigation policy during ***fork & run*** commands when spawning the temporary process.  This can extend the same protection to various post-ex activities.
+</Callout>
+
+
+### DInvoke Manual Mapping
+- Its about manually loading a fresh and new ***NTDLL*** for example into the memory of the remote process without using the **`LoadLibrary()`** method and without touching the  already existing  and hooked ***NTDLL.dll***. Using this technique will allow us to load our  own ***NTDLL.dll*** and use it instead of the originally loaded one, not trigging the ***`PsSetLoadImageNotifyRoutine`*** kernel callback and not touching the one that is hooked by the EDR
+<Callout type="info" emoji="👻">
+    One downside to this technique is that it needs to call some APIs such as ***`NtAllocateVirtualMemory`***, ***`NtWriteVirtualMemory`*** and ***`NtProtectVirtualmemory`*** which will be hooked by the EDRs. However, since the **Windows loader** does also do this, it may not be a problem depending on how aggressive a security solution is.
+</Callout>
+
+If we hooked our process with **injldr.exe**. we won't see any ***`NtCreateProcess`*** calls to the target **notepad.exe** process
+```cs copy filename="DInvoke-Manual-Mapping.cs" showLineNumbers
+// This code will inject a NTDLL image into notpad process
+using System;
+using System.Diagnostics;
+using System.Linq;
+using System.Runtime.InteropServices;
+
+using Data = DInvoke.Data;
+using DInvoke.ManualMap;
+using DInvoke.DynamicInvoke;
+
+namespace ManualMapper
+{
+    internal class Program
+    {
+        [StructLayout(LayoutKind.Sequential)]
+        struct CLIENT_ID
+        {
+            public IntPtr UniqueProcess;
+            public IntPtr UniqueThread;
+        }
+
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+        delegate uint NtOpenProcess(
+            ref IntPtr ProcessHandle,
+            uint AccessMask,
+            ref Data.Native.OBJECT_ATTRIBUTES ObjectAttributes,
+            ref CLIENT_ID ClientId);
+
+        static void Main(string[] args)
+        {
+            // print our own pid
+            var self = Process.GetCurrentProcess();
+            Console.WriteLine("This PID: {0}", self.Id);
+
+            // find an instance of notepad
+            var notepad = Process.GetProcessesByName("notepad").FirstOrDefault();
+
+            if (notepad is null)
+            {
+                Console.WriteLine("No notepad process found");
+                return;
+            }
+
+            // print target pid
+            Console.WriteLine("Target PID: {0}", notepad.Id);
+
+            // map ntdll
+            var map = Map.MapModuleToMemory("C:\\Windows\\System32\\ntdll.dll");
+            Console.WriteLine("NTDLL mapped to 0x{0:X}", map.ModuleBase.ToInt64());
+
+            // prepare paramters
+            var oa = new Data.Native.OBJECT_ATTRIBUTES();
+            var target = new CLIENT_ID
+            {
+                UniqueProcess = (IntPtr)notepad.Id
+            };
+
+            object[] parameters =
+            {
+                IntPtr.Zero, (uint)0x1F0FFF, oa, target
+            };
+
+            // call NtOpenProcess from it
+            var status = (Data.Native.NTSTATUS)Generic.CallMappedDLLModuleExport(
+                map.PEINFO,
+                map.ModuleBase,
+                "NtOpenProcess",
+                typeof(NtOpenProcess),
+                parameters,
+                false);
+
+            Console.WriteLine("Status: {0}", status);
+            Console.WriteLine("hProcess: 0x{0:X}", ((IntPtr)parameters[0]).ToInt64());
+
+            // Free the mapped DLL
+            Map.FreeModule(map);
+        }
+    }
+}
+```
+
+### syscalls
+
+#### syscalls
+[**Outflank's blog post about syscalls**](https://outflank.nl/blog/2019/06/19/red-team-tactics-combining-direct-system-calls-and-srdi-to-bypass-av-edr/) says it all
+
+- X86 processors have 4 levels of privileges called rings. and Windows only supports 2 of them **0** and **3**, respectively called **kernel-mode** and **user-mode** / **userland**
+    <Image src="/images/syscalls-1.png" alt="syscalls-1" width={400} height={400} />
+- Most of the user  activity is done in **ring3**, but  sometimes it needs to transition to **ring0**.
+- The **Win32 APIs** ( such as ***`kernel32.dll`*** and ***`user32.dll`*** ) are designed to be the first port of call for developers. These APIs will then call lower-level APIs such as ***`ntdll.dll`*** which is also in **userland**
+    
+    ![syscalls-2](/images/syscalls-2.png)
+
+    <Callout type="info" emoji="👻">
+    Microsoft purposely do not document most of NTDLLs APIs
+    </Callout>
+- **Example**: 
+    To create a file, the application has to call ***`CreateFileW`*** in ***`kernel32.dll`*** which will call ***`NtCreateFile`*** in ***`NTDLL`*** which will invoke a syscall to ***`ntoskrnl.exe`*** to access the filesystem hardware, the call stack should be like `UserApp.exe -> kernel32.dll -> ntdll.dll -> ntoskrnl.exe`
+
+- The syscall stub for NtOpenProcess in **WinDbg**
+    ![syscalls-3](/images/syscalls-3.png)
+- Every syscall has a unique number, called a System Service Number ( **SSN** ) which can vary across different editions and versions of Windows. On Windows 10, the SSN for ***`NtOpenProcess`*** is `0x0026`.  This is why the CPU instructions for ***`NtOpenProcess`*** move this value into the **EAX** register prior to the syscall instruction. This [j00ru's System Call Table](https://j00ru.vexillium.org/syscalls/nt/64/) has each **SSN** documented
+
+#### Direct vs Indirect Syscalls
+
+**Indirect syscalls**:
+
+ As we have seen previously in Manual Mapping as we loaded a fresh image of **NTDLL** to call Its **unhooked** APIs.
+
+**Direct syscalls**:
+
+- We can execute the `syscall` stub instructions directly, without actually calling the API
+- We can do this in C by enabling **`MASM`** in Visual Studio
+    ![syscalls-4](/images/syscalls-4.png)
+- Using [**Syswhispers3**](https://github.com/klezVirus/SysWhispers3) we can generate the `.c`, `.h` and `.asm` files
+    ```powershell filename="Powershell" copy 
+    python .\syswhispers.py --preset common --out-file c:\temp\syscalls_common -v
+    ```
+
+### Syscalls in CobaltStrike
+**syscalls** can be used in the initial payloads that act as a bootstrap loaders for the **beacon reflective loader**
+#### Syscall types
+There are **3** types of **syscalls**:
+    - **embedded**: is the same as direct. meaning that It executes the `syscall` assembly instruction
+    - **indirect**: moves the memory address of the `syscall` instruction into a CPU register and then jumps to it (meaning that the `syscall` itself won't be in the code).
+        have a look on the difference code between both
+        ![syscalls-4](/images/syscalls-6.png)
+
+        ![syscalls-4](/images/syscalls-7.png)
+    - **indirect_randomized**: notice that in the **indirect** method the `SW3_GetSyscallAddress` method is used to get the address of the `syscall` instruction in the code to be used as a return address so that the exdcution can continue after executing it. and that return address (syscall address) can be checked by EDRs to see if its a syscall to a suspicious NT function. so if we used another NT function address as a return address we can escape from that trap. May be if the EDRs looked on the **SSN** number of the syscalls instead would be a better idea 👻
+        ![syscalls-8](/images/syscalls-8.png)
+
+#### Ways to enable syscalls
+**syscalls** in **CobaltStrike** can be enabled in 3 ways:
+    1. From the **artifact kit**
+        ![syscalls-5](/images/syscalls-5.png)
+    2. In **c2 profile** 
+    3. In the paylaod generator in **Cobalt Strik's client**
+        ![syscalls-9](/images/syscalls-9.png)
+
+### UDRL
+**User-Defined reflective loader** is the ability of CobaltStrike to allow operators to use their own **reflective loaders**
+<Callout type="info" emoji="👻">
+    As we know the reflective loader can be considered the bootstrap application that loads our beacon into memory, in this process the [**reflective dll injection**](https://www.ired.team/offensive-security/code-injection-process-injection/reflective-dll-injection) technique is used
+</Callout>

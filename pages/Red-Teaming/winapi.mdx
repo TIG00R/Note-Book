@@ -1,0 +1,592 @@
+### Introduction
+- There are 2 types of WinAPIs:
+    - **WinAPIs**: from which the most used ones are the base services in `kernel32.dll` and advanced services in `advapi32.dll`.
+    - **Native APIs**: most of these native API calls are implemented in the windows kernel image `ntoskrnl.exe` which are exposed to the user mode through `ntdll.dll`.
+
+- The higher-level WinAPIs call the Native APIs in the background. (Ex: `OpenProcess` in `kernel32.dll` calls `NtOpenProcess` in `ntdll.dll`)
+
+### Ceate process in C++
+- We have to use 2 data structures named `STARTUPINFO` and `PROCESS_INFORMATION`.
+    ```c filename="CreateProcess.cpp" copy /si/ /pi/
+    #include <iostream>
+    #include <Windows.h>
+
+    int main()
+    {
+        STARTUPINFO si;
+        si.cb = sizeof(si);
+        // ZeroMemory is used to zero out the memory region on which the data structure will be written to
+        ZeroMemory(&si, sizeof(si)); 
+
+        PROCESS_INFORMATION pi;
+        ZeroMemory(&pi, sizeof(pi));
+
+        BOOL success = CreateProcess(
+            L"C:\\Windows\\System32\\notepad.exe",
+            NULL,
+            0,
+            0,
+            FALSE,
+            0,
+            NULL,
+            L"C:\\Windows\\System32",
+            &si,
+            &pi);
+
+        if (success)
+        {
+            printf("Process created with PID: %d.\n", pi.dwProcessId);
+            return 0;
+        }
+        else
+        {
+            printf("Failed to create process. Error code: %d.\n", GetLastError());
+            return 1;
+        }
+    }
+    ``` 
+
+### P/Invoke
+
+#### Managed vs Un-Managed code
+**Un-Managed Code**: 
+- Applications that are not under the control of the **CLR** Common Language Runtime are unmanaged
+- The unsafe code or the unmanaged code is a code block that uses a pointer variable.
+- **C** and **C++** are examples of Un-Managed code, which when compiled produce a program in machine code which gets executed directly by the OS.
+
+**Managed Code**:
+- Managed code is a code whose execution is managed by **CLR** Common Language Runtime
+- **CLR** converts the managed code into machine code in the runtime then it gets executed.
+- **CLR** provides automatic memory management, garbage collection, type safety, ...etc.
+- Un-managed code is written in high-level language (ex: C#, F#, ..) which when compiled by their compilers we'll **NOT** get the machine code, instead we'll get an **IL** Intermediary language code which is then gets compiled and executed by the **CLR**.
+
+    Refer to [Difference between managed and un-managed code in NET](https://www.tutorialspoint.com/difference-between-managed-and-unmanaged-code-in-net)
+
+**Using  un-managed code in managed code example**:
+
+Preparing the native library `NativeLibrary.dll` with exported function `HelloWorld()`
+
+```c copy filename="source.cpp" showLineNumbers {4}
+#include <iostream>
+
+//Exporting HelloWorld() from this native library
+extern "C" __declspec(dllexport) void HelloWorld();
+
+void HelloWorld() {
+    std::cout << "Hello World";
+}
+```
+
+Importing and using the exported `HelloWorld()` in **C#** program
+```c# copy filename="PInvokeExample.cs" showLineNumbers {9-10}
+using System;
+using System.Runtime.InteropServices;
+
+namespace ConsoleApp { 
+
+    class Program
+    {
+        // Importing the native library
+        [DllImport("NativeLibrary.dll")]
+        public static extern void HelloWorld();
+
+        static void Main(string[] args)
+                
+        {
+            HelloWorld();
+            Console.ReadLine();
+        }
+
+    }
+}
+```
+![Exported Funtion](/images/exported-function.png)
+
+The same way, we can import and use functions from WinAPI files,  ex: `user32.dll`
+```c# copy filename="PInvokeExample.cs" showLineNumbers {8,9,13}
+using System;
+using System.Runtime.InteropServices;
+
+namespace PInvoke
+{
+    internal class Program
+    {
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        static extern int MessageBoxW(IntPtr hWnd, string lpText, string lpCaption, uint uType);
+
+        static void Main(string[] args)
+        {
+            MessageBoxW(IntPtr.Zero, "My first P/Invoke", "Hello World", 0);
+        }
+    }
+}
+```
+
+If we opened the **dll** file in **IDA** and checked the exports, we'll find the exported `HelloWorld()`.
+### Type Marshalling
+- Its the process of  data type transformation when moving data types between managed and un-managed code.
+- By default, the P/Invoke subsystem tries to automatically marshal data for you, but there may be situations where you need to marshal it manually.
+- P/Invoke handles 99% of cases without issue - this information is more relevant when accessing native APIs without P/Invoke (e.g. D/Invoke).
+
+As an example, If we want  to convert the data types manually without relying on `PInvoke` in the prev example, We would do 
+```c# copy filename="PInvokeExample.cs" showLineNumbers {8-13} /MarshalAs/
+using System;
+using System.Runtime.InteropServices;
+
+namespace PInvoke
+{
+    internal class Program
+    {
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        static extern int MessageBoxW(
+            IntPtr hWnd,
+            [MarshalAs(UnmanagedType.LPWStr)] string lpText,
+            [MarshalAs(UnmanagedType.LPWStr)] string lpCaption,
+            uint uType
+        );
+
+        static void Main(string[] args)
+        {
+            MessageBoxW(IntPtr.Zero, "My first P/Invoke", "Hello World", 0);
+        }
+    }
+}
+```
+
+**Example:** 
+
+Now, we can create a process in **C#** using `CreateProcessW()` from `kernel32.dll` as follows:
+
+```c# copy filename="Win32.cs" showLineNumbers
+using System.Runtime.InteropServices;
+
+internal static class Win32
+{
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern bool CreateProcessW(
+        string lpApplicationName,
+        string lpCommandLine,
+        IntPtr lpProcessAttributes,
+        IntPtr lpThreadAttributes,
+        bool bInheritHandles,
+        uint dwCreationFlags,
+        IntPtr lpEnvironment,
+        string lpCurrentDirectory,
+        ref STARTUPINFO lpStartupInfo,
+        out PROCESS_INFORMATION lpProcessInformation);
+
+    [DllImport("kernel32.dll")]
+    public static extern bool CloseHandle(IntPtr hObject);
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct STARTUPINFO
+    {
+        public int cb;
+        public IntPtr lpReserved;
+        public IntPtr lpDesktop;
+        public IntPtr lpTitle;
+        public int dwX;
+        public int dwY;
+        public int dwXSize;
+        public int dwYSize;
+        public int dwXCountChars;
+        public int dwYCountChars;
+        public int dwFillAttribute;
+        public int dwFlags;
+        public short wShowWindow;
+        public short cbReserved2;
+        public IntPtr lpReserved2;
+        public IntPtr hStdInput;
+        public IntPtr hStdOutput;
+        public IntPtr hStdError;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct PROCESS_INFORMATION
+    {
+        public IntPtr hProcess;
+        public IntPtr hThread;
+        public int dwProcessId;
+        public int dwThreadId;
+    }
+}
+```
+
+Now, prepare our Main Class to use the marshalled functions in `Win32.cs`
+
+```c# filename="CreateProcess.cs" copy showLineNumbers
+using System;
+using System.Runtime.InteropServices;
+
+namespace CreateProcess
+{
+    internal class Program
+    {
+        static void Main(string[] args)
+        {
+            // create startup info
+            var startupInfo = new Win32.STARTUPINFO();
+            startupInfo.cb = Marshal.SizeOf(startupInfo);
+
+            // create process
+            var success = Win32.CreateProcessW(
+                null,
+                "notepad.exe\0",
+                IntPtr.Zero,
+                IntPtr.Zero,
+                false,
+                0,
+                IntPtr.Zero,
+                null,
+                ref startupInfo,
+                out var processInfo);
+
+            // bail if it failed
+            if (!success)
+            {
+                Console.WriteLine($"[x] CreateProcessW failed: {Marshal.GetLastWin32Error()}");
+                return;
+            }
+
+            // print process info
+            Console.WriteLine("dwProcessId : {0}", processInfo.dwProcessId);
+            Console.WriteLine("dwThreadId  : {0}", processInfo.dwThreadId);
+            Console.WriteLine("hProcess    : 0x{0:X}", processInfo.hProcess);
+            Console.WriteLine("hThread     : 0x{0:X}", processInfo.hThread);
+
+            // close handles
+            Win32.CloseHandle(processInfo.hThread);
+            Win32.CloseHandle(processInfo.hProcess);
+        }
+    }
+}
+```
+
+### Ordinals
+- We can implement a simple obfuscation technique using function ordinal. [Exporting from a DLL Using DEF Files
+](https://learn.microsoft.com/en-us/cpp/build/exporting-from-a-dll-using-def-files?view=msvc-170)
+- ordinals are numbers given for each exported function in the dll from 1 to N where N is the number of exported functions. then the exported functions can be  imported using  this number istead of the name which may trick some AVs
+- This is a simple technique to hide easily detectable strings like `CreateProcessW()` 
+- If we inspected the  previous example exe in `pestudio` we can see a flag 
+- So, In our example, we can use the ordinal of the `CreateProcessW()` and name it anything ex: `BenignFunction()`
+```c# copy filename="Win32.cs" showLineNumbers {5,6} /EntryPoint="#233"/ /BenignFunction/
+using System.Runtime.InteropServices;
+
+internal static class Win32
+{
+    [DllImport("kernel32.dll",EntryPoint="#233", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern bool BenignFunction(
+        string lpApplicationName,
+        string lpCommandLine,
+        IntPtr lpProcessAttributes,
+        IntPtr lpThreadAttributes,
+        bool bInheritHandles,
+        uint dwCreationFlags,
+        IntPtr lpEnvironment,
+        string lpCurrentDirectory,
+        ref STARTUPINFO lpStartupInfo,
+        out PROCESS_INFORMATION lpProcessInformation);
+
+    [DllImport("kernel32.dll")]
+    public static extern bool CloseHandle(IntPtr hObject);
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct STARTUPINFO
+    {
+        public int cb;
+        public IntPtr lpReserved;
+        public IntPtr lpDesktop;
+        public IntPtr lpTitle;
+        public int dwX;
+        public int dwY;
+        public int dwXSize;
+        public int dwYSize;
+        public int dwXCountChars;
+        public int dwYCountChars;
+        public int dwFillAttribute;
+        public int dwFlags;
+        public short wShowWindow;
+        public short cbReserved2;
+        public IntPtr lpReserved2;
+        public IntPtr hStdInput;
+        public IntPtr hStdOutput;
+        public IntPtr hStdError;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct PROCESS_INFORMATION
+    {
+        public IntPtr hProcess;
+        public IntPtr hThread;
+        public int dwProcessId;
+        public int dwThreadId;
+    }
+}
+```
+
+
+```c# filename="CreateProcess.cs" copy showLineNumbers /BenignFunction/ {15}
+using System;
+using System.Runtime.InteropServices;
+
+namespace CreateProcess
+{
+    internal class Program
+    {
+        static void Main(string[] args)
+        {
+            // create startup info
+            var startupInfo = new Win32.STARTUPINFO();
+            startupInfo.cb = Marshal.SizeOf(startupInfo);
+
+            // create process
+            var success = Win32.BenignFunction(
+                null,
+                "notepad.exe\0",
+                IntPtr.Zero,
+                IntPtr.Zero,
+                false,
+                0,
+                IntPtr.Zero,
+                null,
+                ref startupInfo,
+                out var processInfo);
+
+            // bail if it failed
+            if (!success)
+            {
+                Console.WriteLine($"[x] CreateProcessW failed: {Marshal.GetLastWin32Error()}");
+                return;
+            }
+
+            // print process info
+            Console.WriteLine("dwProcessId : {0}", processInfo.dwProcessId);
+            Console.WriteLine("dwThreadId  : {0}", processInfo.dwThreadId);
+            Console.WriteLine("hProcess    : 0x{0:X}", processInfo.hProcess);
+            Console.WriteLine("hThread     : 0x{0:X}", processInfo.hThread);
+
+            // close handles
+            Win32.CloseHandle(processInfo.hThread);
+            Win32.CloseHandle(processInfo.hProcess);
+        }
+    }
+}
+```
+We can notice that  there is no flags this time for the  `CreateProcessW()` API call
+![pestudio-ordinal](/images/pestudio-ordinal.png)
+**Notice**: The ordinal won't work unless we allow the unsafe code as following:
+![allow-unsafe-code](/images/enable-unsafe-code.png)
+
+![allow-unsafe-code2](/images/enable-unsafe-code-2.png)
+
+### CreateProcess in VBA 
+```vb copy filename="test.vb" showLineNumbers
+Declare PtrSafe Function CreateProcessW Lib "kernel32.dll" (ByVal lpApplicationName As String, ByVal lpCommandLine As String, ByVal lpProcessAttributes As LongPtr, ByVal lpThreadAttributes As LongPtr, ByVal bInheritHandles As Boolean, ByVal dwCreationFlags As Long, ByVal lpEnvironment As LongPtr, ByVal lpCurrentDirectory As String, lpStartupInfo As STARTUPINFO, lpProcessInformation As PROCESS_INFORMATION) As Boolean
+
+Type STARTUPINFO
+    cb As Long
+    lpReserved As String
+    lpDesktop As String
+    lpTitle As String
+    dwX As Long
+    dwY As Long
+    dwXSize As Long
+    dwYSize As Long
+    dwXCountChars As Long
+    dwYCountChars As Long
+    dwFillAttribute As Long
+    dwFlags As Long
+    wShowWindow As Integer
+    cbReserved2 As Integer
+    lpReserved2 As LongPtr
+    hStdInput As LongPtr
+    hStdOutput As LongPtr
+    hStdError As LongPtr
+End Type
+
+Type PROCESS_INFORMATION
+    hProcess As LongPtr
+    hThread As LongPtr
+    dwProcessId As Long
+    dwThreadId As Long
+End Type
+
+Sub Demo()
+    Dim startup_info As STARTUPINFO
+    Dim process_info As PROCESS_INFORMATION
+    
+    Dim nullStr As String
+    
+    Dim success As Boolean
+    success = CreateProcessW(nullStr, StrConv("notepad.exe", vbUnicode), 0&, 0&, False, 0, 0&, nullStr, startup_info, process_info)
+End Sub
+```
+### DInvoke
+Using  [Rasta's Minimized DInvoke](https://github.com/rasta-mouse/DInvoke)
+Importing it as a reference in the project
+
+Example
+
+```c# copy showLineNumbers filename="win32.cs" {6,7}
+using System;
+using System.Runtime.InteropServices;
+
+internal static class win32
+{
+    [UnmanagedFunctionPointer(CallingConvention.StdCall, CharSet = CharSet.Unicode, SetLastError = true)]
+    public  delegate bool CreateProcessDelegate(
+        string lpApplicationName,
+        string lpCommandLine,
+        IntPtr lpProcessAttributes,
+        IntPtr lpThreadAttributes,
+        bool bInheritHandles,
+        uint dwCreationFlags,
+        IntPtr lpEnvironment,
+        string lpCurrentDirectory,
+        ref STARTUPINFO lpStartupInfo,
+        out PROCESS_INFORMATION lpProcessInformation);
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct STARTUPINFO
+    {
+        public int cb;
+        public IntPtr lpReserved;
+        public IntPtr lpDesktop;
+        public IntPtr lpTitle;
+        public int dwX;
+        public int dwY;
+        public int dwXSize;
+        public int dwYSize;
+        public int dwXCountChars;
+        public int dwYCountChars;
+        public int dwFillAttribute;
+        public int dwFlags;
+        public short wShowWindow;
+        public short cbReserved2;
+        public IntPtr lpReserved2;
+        public IntPtr hStdInput;
+        public IntPtr hStdOutput;
+        public IntPtr hStdError;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct PROCESS_INFORMATION
+    {
+        public IntPtr hProcess;
+        public IntPtr hThread;
+        public int dwProcessId;
+        public int dwThreadId;
+    }
+}
+```
+
+```c# filename="program.cs" copy showLineNumbers {34}
+using DInvoke.DynamicInvoke;
+using System;
+using System.Runtime.InteropServices;
+
+namespace DInvoke_Project
+{
+    internal class Program
+    {
+        
+        static void Main(string[] args)
+        {
+            
+
+            // create startup info
+            var startupInfo = new win32.STARTUPINFO();
+            startupInfo.cb = Marshal.SizeOf(startupInfo);
+
+            // create process
+
+            // api parameters
+            object[] parameters =
+        { null,
+                "notepad.exe\0",
+                IntPtr.Zero,
+                IntPtr.Zero,
+                false,
+                (uint)0,
+                IntPtr.Zero,
+                null,
+                startupInfo,
+                new win32.PROCESS_INFORMATION()
+        };
+            //dynamic invoke
+            var success = (bool)Generic.DynamicApiInvoke("kernel32.dll", "CreateProcessW", typeof(win32.CreateProcessDelegate), ref parameters);
+
+        }
+    }
+}
+
+```
+
+### DInvoke with Ordinals
+DInvoke is also compatible with ordinals
+
+
+### DInvoke with API Hashing
+- We can use API hashing as another way to avoid mentioning the library or the API name in the code directly, hence evading some of the static analysis techniques.
+- That can be done using `GetApiHash()` using the name of the library or the API and a key  then we can call the API using one of those 2 methods `GetLoadedModuleAddress()` and `GetExportAddress()`
+
+-  Install **csharprepl**
+    ``` powershell copy
+    dotnet tool install -g csharprepl
+    ```
+
+- Using API hash to get the hashes of a dll or an API with a hashing key
+    ``` cs copy 
+    # In a powershell terminal open a cshareprepl session
+    csharprepl.exe
+
+    # Get the hash 
+    DInvoke.DynamicInvoke.Utilities.GetApiHash("kernel32.dll",0xdeadbeef)
+    DInvoke.DynamicInvoke.Utilities.GetApiHash("CreateProcessW",0xdeadbeef)
+    ```
+
+- The complete project
+    ```cs copy filename="program.cs" showLineNumbers {35-36}
+        using DInvoke.DynamicInvoke;
+        using System;
+        using System.Runtime.InteropServices;
+
+        namespace DInvoke_Project
+        {
+            internal class Program
+            {
+                
+                static void Main(string[] args)
+                {
+                    
+
+                    // create startup info
+                    var startupInfo = new win32.STARTUPINFO();
+                    startupInfo.cb = Marshal.SizeOf(startupInfo);
+
+                    // create process
+
+                    // api parameters
+                    object[] parameters =
+                { null,
+                        "calc.exe\0",
+                        IntPtr.Zero,
+                        IntPtr.Zero,
+                        false,
+                        (uint)0,
+                        IntPtr.Zero,
+                        null,
+                        startupInfo,
+                        new win32.PROCESS_INFORMATION()
+                };
+
+                    // Getting a pointer to the API
+                    var hLibrary = Generic.GetLoadedModuleAddress("56CC05AB6D069D47DF2539FE99937D46", 0Xdeadbeef);
+                    var hAPI = Generic.GetExportAddress(hLibrary,"B9825E679978ACD8B8C4873B1A5751C9", 0xdeadbeef);
+                    //dynamic invoke
+                    var success = (bool)Generic.DynamicFunctionInvoke(hAPI, typeof(win32.CreateProcessDelegate), ref parameters);
+
+                }
+            }
+        }
+    ```
