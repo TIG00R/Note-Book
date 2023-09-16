@@ -5,6 +5,11 @@
     "winapi":"WinAPI" ,
     "process_injection":"Process Injection",
     "hunting_the_hunters":"Hunting The Hunters",
+    "defense_evasion":"Defense Evasion",
+    "asr":"ASR",
+    "wdac":"WDAC",
+    "protected_process":"Protected Process",
+    "edr_evasion":"EDR Evasion",
     "linux_helpful_commands":"Linux Helpful Commands",
     "windows_helpful_commands":"Windows Helpful Commands",
     "to_watch":"To Watch"

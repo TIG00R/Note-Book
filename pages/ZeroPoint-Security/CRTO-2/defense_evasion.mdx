@@ -15,7 +15,7 @@ CS's post exploitation commands are of 4 types:
 - So in this case - 1 RWX region is allocated by the injector and the other RWX region by the reflective loader.
 - Many defensive products will alert on RWX memory regions within a native process as potentially malicious.
 - We can change this **RWX** permission by changing this configuration in the malleable C2 Porfile
-```  copy
+```  copy  filename="c2.profile"
 stage {
     set userwx "false";
     set cleanup "true";
@@ -173,13 +173,13 @@ and after a few seconds, we won't be able to access it, don't know why 🙋‍�
 - The `spawnto` command controls which binary is used as a temporary process for fork and run commands.
 - The default behaviour of CS beacons is to spawn the binaries under the beacons's process, and as expected, this is universally detected as a malicious activity and the beacon will be killed by the **Defender**
 - To use `spawnto`
-  ```bash copy
-  beacon> spawnto x64 %windir%\sysnative\notepad.exe
+  ```bash copy filename="Bacon >"
+  spawnto x64 %windir%\sysnative\notepad.exe
   ```
 - When we use `spawnto` with as an example `notepad.exe`, we'll bypass the detection of Defender and notice that the beacon didn't get killed.
 ![spawnto](/images/spawnto-1.png)
 - If we want to set an executable as a default `spawnto` we can add the following directive to our profile
-```json copy  
+```copy filename="c2.profile"  
 post-ex {
     set spawnto_x86 "%windir%\\syswow64\\notepad.exe";
     set spawnto_x64 "%windir%\\sysnative\\notepad.exe";
@@ -190,7 +190,7 @@ post-ex {
 Fork & run commands have two variants:
 - **process injection spawn**: these commands spawns a new process and inject the post-ex capability into it, just like the previous example 
 - **process injection explicit**: these commands inject the post-ex capabilities into an already running process
-- Beacon has two internal APIs that are responsible for these behaviours, called `BeaconInjectTemporaryProcess` and `BeaconInjectProcess`.  They are define in `beacon.h`
+- Beacon has two internal APIs that are responsible for these behaviours, called `BeaconInjectTemporaryProcess` and `BeaconInjectProcess`.  They are defined in `beacon.h`
 - In versions of Cobalt Strike prior to 4.5, the actual APIs used to control the "style" of process injection could only be controlled in the malleable C2 profile.
 - The **Process Inject Kit** was introduced as method of allowing operators to write their own custom implementations as a BOF.
 - The arsenal kit can be downloaded using a license from here [CS Arsenal Kit](https://download.cobaltstrike.com/scripts)
